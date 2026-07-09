@@ -101,8 +101,6 @@ def compute_blooms_by_type(
     3. Distribute pool round-robin across types so each type gets a proportional mix.
     """
     BLOOM_ORDER = ["Remember", "Understand", "Apply", "Analyze", "Evaluate", "Create"]
-    # Normalize incoming keys to title-case so "create"/"CREATE"/"Create" all match
-    blooms_distribution = {k.capitalize(): v for k, v in blooms_distribution.items()}
 
     active_types = [t for t in question_type_counts if question_type_counts.get(t, 0) > 0]
     total = sum(question_type_counts[t] for t in active_types)

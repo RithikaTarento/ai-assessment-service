@@ -207,8 +207,8 @@ async def generate_v1(
     if blooms_config:
         try:
             raw = json.loads(blooms_config)
-            # Normalize keys to lowercase for consistent storage and status response
-            b_dist = {k.lower(): v for k, v in raw.items()}
+            # Normalize keys to title-case for internal storage and computation
+            b_dist = {k.capitalize(): v for k, v in raw.items()}
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON for blooms_config")
 
@@ -355,6 +355,18 @@ async def check_status_v1(job_id: str, user_id: str = Depends(get_current_user))
         logger.warning(f"[{job_id}] Status check — access denied | requester={user_id} | owner={status.get('user_id')}")
         raise HTTPException(status_code=403, detail="Access denied: you do not own this assessment")
     logger.info(f"[{job_id}] Status check — current status={status.get('status')}")
+
+    # Lowercase blooms_config keys in the response to match generate endpoint format
+    meta = status.get("metadata") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    config = meta.get("config") or {}
+    if "blooms_config" in config and isinstance(config["blooms_config"], dict):
+        config["blooms_config"] = {k.lower(): v for k, v in config["blooms_config"].items()}
+
     return status
 
 from pydantic import BaseModel
