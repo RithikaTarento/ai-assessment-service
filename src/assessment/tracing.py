@@ -15,7 +15,9 @@ logger = logging.getLogger("assessment-api")
 
 _client: Any = None
 _enabled: bool = False
-_MAX_IO_CHARS = 4000
+# No truncation — full prompts and outputs are preserved for Langfuse inspection.
+# Set to an integer (e.g. 50_000) if you ever need to limit payload size.
+_MAX_IO_CHARS: Optional[int] = None
 
 # Prevents the auto-patch from double-counting calls wrapped with generation()
 _manual_gen: contextvars.ContextVar[bool] = contextvars.ContextVar("lf_manual_gen", default=False)
@@ -211,7 +213,8 @@ def record_gemini_usage(response, *, output=None) -> None:
 # ---------------------------------------------------------------------------
 
 def _trunc(v):
-    if isinstance(v, str) and len(v) > _MAX_IO_CHARS:
+    """Return v unchanged. _MAX_IO_CHARS=None means no truncation (full content preserved)."""
+    if _MAX_IO_CHARS is not None and isinstance(v, str) and len(v) > _MAX_IO_CHARS:
         return v[:_MAX_IO_CHARS] + f"… [+{len(v) - _MAX_IO_CHARS} chars]"
     return v
 

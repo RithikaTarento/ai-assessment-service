@@ -88,7 +88,14 @@ async def process_job(payload: Dict[str, Any]):
             user_id=str(user_id) if user_id else None,
             session_id=f"{user_id}:{job_id}" if user_id else job_id,
             tags=["worker", "generate", str(assessment_type)],
+            # Metadata — visible in Langfuse trace detail view
             job_id=job_id,
+            assessment_type=str(assessment_type),
+            difficulty=str(payload.get("difficulty", "")),
+            total_questions=str(payload.get("total_questions", "")),
+            language=str(payload.get("language", "")),
+            course_ids=str(course_ids),
+            model=str(os.getenv("GENAI_MODEL_NAME", "unknown")),
         ):
             metadata, assessment, usage = await generate_assessment(
                 course_ids=course_ids,
