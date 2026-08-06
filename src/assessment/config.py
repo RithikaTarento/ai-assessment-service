@@ -43,6 +43,13 @@ GOOGLE_LOCATION = os.getenv("GOOGLE_LOCATION", "us-central1")
 GENAI_MODEL_NAME = os.getenv("GENAI_MODEL_NAME", "gemini-2.5-pro")
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
+# Langfuse Observability (opt-in — set LANGFUSE_ENABLED=true to activate)
+LANGFUSE_ENABLED = os.getenv("LANGFUSE_ENABLED", "false").lower() == "true"
+LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
+LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+LANGFUSE_SAMPLE_RATE = float(os.getenv("LANGFUSE_SAMPLE_RATE", "1.0"))
+
 # Storage backend for standalone upload file sharing between API and Worker pods
 # DOCUMENT_STORAGE_TYPE: "local" (default, single-node) | "gcs" (multi-pod / Kubernetes)
 DOCUMENT_STORAGE_TYPE = os.getenv("DOCUMENT_STORAGE_TYPE", "local")

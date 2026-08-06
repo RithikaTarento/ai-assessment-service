@@ -16,6 +16,7 @@ from .generator import generate_assessment
 from .events import get_kafka_consumer, send_completion_event, stop_kafka_producer
 from .config import INTERACTIVE_COURSES_PATH
 from .storage import get_storage_service
+from . import tracing
 
 log_dir = Path("logs")
 log_dir.mkdir(exist_ok=True)
@@ -73,27 +74,41 @@ async def process_job(payload: Dict[str, Any]):
                 logger.warning(f"[{job_id}] Content fetch failed for course: {cid} — will attempt generation without it")
 
         # 4. Generate with LLM
+        # Set identity for Langfuse tracing (safe no-op when disabled).
+        # Worker runs outside FastAPI request context so we set identity explicitly here.
+        tracing.set_identity(
+            user_id=str(user_id) if user_id else None,
+            session_id=f"{user_id}:{job_id}" if user_id else job_id,
+            tags=["worker", "generate", str(assessment_type)],
+        )
         logger.info(f"[{job_id}] Starting LLM generation | model={os.getenv('GENAI_MODEL_NAME', 'unknown')}")
         t_llm = time.monotonic()
-        metadata, assessment, usage = await generate_assessment(
-            course_ids=course_ids,
-            assessment_type=assessment_type,
-            difficulty_level=payload.get('difficulty'),
-            total_questions=payload.get('total_questions'),
-            question_type_counts=payload.get('question_type_counts'),
-            additional_instructions=payload.get('additional_instructions'),
-            input_language=payload.get('language'),
-            topic_names=payload.get('topic_names'),
-            blooms_distribution=payload.get('blooms_distribution'),
-            enable_blooms=payload.get('enable_blooms', True),
-            course_weightage=payload.get('course_weightage'),
-            time_limit=payload.get('time_limit'),
-            extra_files=extra_files,
-            competency_area=payload.get('competency_area'),
-            competency_themes=payload.get('competency_themes'),
-            competency_sub_themes=payload.get('competency_sub_themes'),
-            course_names=payload.get('course_names', []),
-        )
+        with tracing.trace(
+            name=f"assessment:{assessment_type}",
+            user_id=str(user_id) if user_id else None,
+            session_id=f"{user_id}:{job_id}" if user_id else job_id,
+            tags=["worker", "generate", str(assessment_type)],
+            job_id=job_id,
+        ):
+            metadata, assessment, usage = await generate_assessment(
+                course_ids=course_ids,
+                assessment_type=assessment_type,
+                difficulty_level=payload.get('difficulty'),
+                total_questions=payload.get('total_questions'),
+                question_type_counts=payload.get('question_type_counts'),
+                additional_instructions=payload.get('additional_instructions'),
+                input_language=payload.get('language'),
+                topic_names=payload.get('topic_names'),
+                blooms_distribution=payload.get('blooms_distribution'),
+                enable_blooms=payload.get('enable_blooms', True),
+                course_weightage=payload.get('course_weightage'),
+                time_limit=payload.get('time_limit'),
+                extra_files=extra_files,
+                competency_area=payload.get('competency_area'),
+                competency_themes=payload.get('competency_themes'),
+                competency_sub_themes=payload.get('competency_sub_themes'),
+                course_names=payload.get('course_names', []),
+            )
         llm_duration = round(time.monotonic() - t_llm, 2)
         input_tokens = usage.get('prompt_token_count', 'N/A') if usage else 'N/A'
         output_tokens = usage.get('candidates_token_count', 'N/A') if usage else 'N/A'
@@ -147,7 +162,10 @@ async def process_job(payload: Dict[str, Any]):
 
 async def run_worker():
     logger.info("Starting Worker Service...")
-    
+
+    # Langfuse observability (no-op when LANGFUSE_ENABLED=false)
+    tracing.init()
+
     # Init DB Connection
     await init_db()
     
@@ -178,6 +196,7 @@ async def run_worker():
         await consumer.stop()
         await stop_kafka_producer()
         await close_db()
+        tracing.shutdown()
         logger.info("Worker Stopped")
 
 if __name__ == "__main__":

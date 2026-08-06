@@ -17,6 +17,7 @@ from .exporters import generate_pdf, generate_docx
 from .cleanup import start_cleanup_scheduler, stop_cleanup_scheduler
 from .events import stop_kafka_producer, send_request_event
 from .exporters_csv_v2 import generate_csv_v2, generate_csv_basic
+from . import tracing
 
 # Configure Logging
 log_dir = Path("logs")
@@ -42,19 +43,23 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(f"Missing mandatory env vars: {', '.join(missing)}")
     logger.info(f"SSO configured: {JWKS_URL}")
 
+    # Langfuse observability (no-op when LANGFUSE_ENABLED=false)
+    tracing.init()
+
     try:
         await init_db()
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
-    
+
     # Start Background Scheduler
     start_cleanup_scheduler()
-    
+
     yield
-    
+
     stop_cleanup_scheduler()
     await stop_kafka_producer()
     await close_db()
+    tracing.shutdown()
     logger.info("Shutting down Assessment API...")
 
 app = FastAPI(
@@ -158,6 +163,13 @@ async def generate_v1(
        - Returns 202 Accepted if new generation started.
     """
     
+    # Attach identity for Langfuse tracing (no-op when disabled)
+    tracing.set_identity(
+        user_id=user_id,
+        session_id=f"{user_id}:{assessment_type}",
+        tags=["generate", str(assessment_type)],
+    )
+
     # --- 1. Validation & Logic Reuse (Same as V1) ---
     valid_files = []
     if files:
@@ -346,6 +358,7 @@ async def generate_v1(
 
 @api_v1_router.get("/status/{job_id}", summary="Get Assessment Status")
 async def check_status_v1(job_id: str, user_id: str = Depends(get_current_user)):
+    tracing.set_identity(user_id=user_id, session_id=f"{user_id}:{job_id}", tags=["status"])
     logger.info(f"[{job_id}] Status check | user={user_id}")
     status = await get_assessment_status(job_id)
     if not status:
