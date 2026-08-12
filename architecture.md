@@ -20,9 +20,9 @@ graph TD
         Worker -- "Publish: assessment.lifecycle.events" --> Kafka
     end
 
-    subgraph "Storage"
+    subgraph "Persistence"
         API & Worker --> DB[("PostgreSQL<br/>assessment_jobs")]
-        API & Worker --> Storage["Storage Layer<br/>(local disk / GCS)"]
+        API & Worker --> FileStorage["Storage Layer<br/>(local disk / GCS)"]
     end
 
     API --> IdP["Sunbird SSO<br/>(JWKS validation)"]
