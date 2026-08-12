@@ -46,12 +46,12 @@ async def lifespan(app: FastAPI):
         await init_db()
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
-    
+
     # Start Background Scheduler
     start_cleanup_scheduler()
-    
+
     yield
-    
+
     stop_cleanup_scheduler()
     await stop_kafka_producer()
     await close_db()
