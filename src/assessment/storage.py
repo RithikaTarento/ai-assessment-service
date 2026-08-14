@@ -43,6 +43,16 @@ class StorageService(ABC):
         """Check if file exists at stored_path."""
         pass
 
+    @abstractmethod
+    def sync_directory_to_storage(self, local_dir: Path, storage_prefix: str) -> None:
+        """Upload all files in local_dir recursively to the storage backend under storage_prefix."""
+        pass
+
+    @abstractmethod
+    def sync_directory_from_storage(self, storage_prefix: str, local_dir: Path) -> bool:
+        """Download all files from storage_prefix into local_dir. Returns True if any files were found."""
+        pass
+
 
 class LocalStorageService(StorageService):
     """Local filesystem storage — for single-node / Docker Compose deployments"""
@@ -90,6 +100,23 @@ class LocalStorageService(StorageService):
 
     def file_exists(self, stored_path: str) -> bool:
         return (self.root_path / stored_path).exists()
+
+    def sync_directory_to_storage(self, local_dir: Path, storage_prefix: str) -> None:
+        dest = self.root_path / storage_prefix
+        if local_dir.resolve() == dest.resolve():
+            return
+        if local_dir.exists():
+            shutil.copytree(str(local_dir), str(dest), dirs_exist_ok=True)
+            logger.info(f"sync_directory_to_storage (local): {local_dir} → {dest}")
+
+    def sync_directory_from_storage(self, storage_prefix: str, local_dir: Path) -> bool:
+        src = self.root_path / storage_prefix
+        if not src.exists() or not any(src.rglob("*")):
+            return False
+        local_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(str(src), str(local_dir), dirs_exist_ok=True)
+        logger.info(f"sync_directory_from_storage (local): {src} → {local_dir}")
+        return True
 
 
 class GCSStorageService(StorageService):
@@ -145,6 +172,34 @@ class GCSStorageService(StorageService):
 
     def file_exists(self, stored_path: str) -> bool:
         return self.bucket.blob(stored_path).exists()
+
+    def sync_directory_to_storage(self, local_dir: Path, storage_prefix: str) -> None:
+        prefix = storage_prefix.strip("/")
+        uploaded = 0
+        for file_path in local_dir.rglob("*"):
+            if not file_path.is_file():
+                continue
+            relative = file_path.relative_to(local_dir)
+            blob_name = f"{prefix}/{relative.as_posix()}"
+            self.bucket.blob(blob_name).upload_from_filename(str(file_path))
+            uploaded += 1
+        logger.info(f"sync_directory_to_storage (GCS): {local_dir} → gs://{self.bucket_name}/{prefix}/ ({uploaded} files)")
+
+    def sync_directory_from_storage(self, storage_prefix: str, local_dir: Path) -> bool:
+        prefix = storage_prefix.strip("/") + "/"
+        blobs = list(self.client.list_blobs(self.bucket_name, prefix=prefix))
+        if not blobs:
+            return False
+        local_dir.mkdir(parents=True, exist_ok=True)
+        for blob in blobs:
+            relative_name = blob.name[len(prefix):]
+            if not relative_name:
+                continue
+            dest = local_dir / relative_name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            blob.download_to_filename(str(dest))
+        logger.info(f"sync_directory_from_storage (GCS): gs://{self.bucket_name}/{prefix} → {local_dir} ({len(blobs)} files)")
+        return True
 
 
 _storage_service: StorageService = None

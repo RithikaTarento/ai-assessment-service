@@ -6,7 +6,8 @@ import logging
 import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-from .config import SEARCH_API_URL, TRANSCODER_STATS_URL, API_HEADERS
+from .config import SEARCH_API_URL, TRANSCODER_STATS_URL, API_HEADERS, GCS_COURSE_CONTENT_PREFIX
+from .storage import get_storage_service
 
 logger = logging.getLogger(__name__)
 
@@ -16,16 +17,27 @@ async def fetch_course_data(course_id: str, output_base_path: Path):
     Replicates the logic from pdf_video_meta.html.
     """
     output_base_path.mkdir(parents=True, exist_ok=True)
-    
+    loop = asyncio.get_running_loop()
+    storage = get_storage_service()
+    gcs_prefix = f"{GCS_COURSE_CONTENT_PREFIX}/{course_id}"
+
     async with httpx.AsyncClient(timeout=30.0, headers=API_HEADERS) as client:
-        # 0. Check for Local Cache (Fast Path)
-        # We assume folder name == course_id mostly. 
-        # If identifier differs, we might re-download once, which is acceptable safety.
+        # Tier 1: Local disk cache
         potential_cache = output_base_path / course_id / "metadata.json"
         if potential_cache.exists():
-             logger.info(f"Local cache found for {course_id}. Skipping download.")
-             return True
+            logger.info(f"Local cache hit for {course_id}. Skipping download.")
+            return True
 
+        # Tier 2: GCS cache — populate local disk then proceed
+        course_local_path = output_base_path / course_id
+        found_in_gcs = await loop.run_in_executor(
+            None, storage.sync_directory_from_storage, gcs_prefix, course_local_path
+        )
+        if found_in_gcs:
+            logger.info(f"GCS cache hit for {course_id}. Restored to local disk.")
+            return True
+
+        # Tier 3: Fetch from Learning API
         # 1. Fetch Root Course
         root_node = await search_content(client, course_id)
         if not root_node:
@@ -49,6 +61,15 @@ async def fetch_course_data(course_id: str, output_base_path: Path):
                     await process_node(client, leaf_node, leaf_folder)
             except Exception as e:
                 logger.error(f"Error processing leaf node {leaf_id}: {e}")
+
+    # Sync fetched content to GCS for cross-pod reuse
+    try:
+        await loop.run_in_executor(
+            None, storage.sync_directory_to_storage, course_folder, gcs_prefix
+        )
+        logger.info(f"Course content for {course_id} synced to GCS at {gcs_prefix}")
+    except Exception as e:
+        logger.warning(f"Failed to sync course content to GCS for {course_id}: {e}")
 
     return True
 

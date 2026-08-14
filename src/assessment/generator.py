@@ -4,6 +4,7 @@ import hashlib
 import asyncio
 import logging
 import time
+import random
 import yaml
 import fitz  # PyMuPDF
 from pathlib import Path
@@ -15,8 +16,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from .config import (
     DATABASE_URL,
-    GOOGLE_PROJECT_ID, GOOGLE_LOCATION, GENAI_MODEL_NAME, 
-    GOOGLE_APPLICATION_CREDENTIALS, PROMPT_VERSION
+    GOOGLE_PROJECT_ID, GOOGLE_LOCATION, GENAI_MODEL_NAME,
+    GOOGLE_APPLICATION_CREDENTIALS, PROMPT_VERSION, INTERACTIVE_COURSES_PATH
 )
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,58 @@ async def get_or_create_kcm_cache() -> str:
         logger.error(f"Failed to create KCM cache: {e}")
         return None
 
+def compute_blooms_by_type(
+    blooms_distribution: Dict[str, int],
+    question_type_counts: Dict[str, int],
+) -> Dict[str, List[str]]:
+    """
+    Converts bloom % distribution into exact per-type level lists.
+    No ceiling restrictions — only the user's percentages and question counts matter.
+
+    1. Convert percentages to integer counts (largest-remainder, sums to total).
+    2. Build a flat pool of levels (shuffled).
+    3. Distribute pool round-robin across types so each type gets a proportional mix.
+    """
+    BLOOM_ORDER = ["Remember", "Understand", "Apply", "Analyze", "Evaluate", "Create"]
+
+    active_types = [t for t in question_type_counts if question_type_counts.get(t, 0) > 0]
+    total = sum(question_type_counts[t] for t in active_types)
+
+    # Step 1: percentage → integer counts (largest-remainder)
+    active_levels = {k: v for k, v in blooms_distribution.items() if v > 0}
+    items = sorted(active_levels.items(), key=lambda x: -x[1])
+    level_counts: Dict[str, int] = {}
+    remaining = total
+    for i, (level, pct) in enumerate(items):
+        if i == len(items) - 1:
+            count = remaining
+        else:
+            count = round(total * pct / 100)
+            count = min(count, remaining)
+        level_counts[level] = count
+        remaining -= count
+        if remaining <= 0:
+            break
+
+    # Step 2: build flat pool sorted highest→lowest then shuffle
+    pool: List[str] = []
+    for level in reversed(BLOOM_ORDER):
+        pool.extend([level] * level_counts.get(level, 0))
+    random.shuffle(pool)
+
+    # Step 3: distribute round-robin across types
+    result: Dict[str, List[str]] = {t: [] for t in active_types}
+    type_cycle = []
+    for t in active_types:
+        type_cycle.extend([t] * question_type_counts[t])
+    random.shuffle(type_cycle)
+
+    for t, level in zip(type_cycle, pool):
+        result[t].append(level)
+
+    return result
+
+
 async def generate_assessment(
     question_type_counts: Dict[str, int],
     course_folder: Optional[Path] = None, # Deprecated in v3.2, kept for backward compat
@@ -106,6 +159,7 @@ async def generate_assessment(
     competency_area: Optional[str] = None,
     competency_themes: Optional[str] = None,
     competency_sub_themes: Optional[str] = None,
+    course_names: Optional[List[str]] = None,
 ) -> Tuple[Dict, Dict, Dict]:
     """
     Generates assessment for one or multiple courses.
@@ -129,13 +183,12 @@ async def generate_assessment(
     else:
         composite_id = "custom_content_generation"
     
-    # Base Path for Interactive Courses (should probably be passed in, but using config implied path for now)
-    base_path = Path("/app/interactive_courses_data") 
+    base_path = Path(INTERACTIVE_COURSES_PATH)
     
     logger.info(f"Generating assessment for {composite_id} (Type: {assessment_type})")
 
     # 1. Aggregate Content from All Courses
-    aggregated_metadata = {"courses": []}
+    aggregated_metadata = {"courses": [], "content_availability": {}}
     combined_transcript = []
     combined_pdfs = []
     
@@ -146,10 +199,15 @@ async def generate_assessment(
     seen_content_hashes = set()
 
     if course_ids:
-        for cid in course_ids:
+        for idx, cid in enumerate(course_ids):
             c_path = base_path / cid
             if not c_path.exists():
                 logger.warning(f"Course folder {cid} not found, skipping.")
+                # If caller supplied a course name, inject it so LLM never outputs N/A
+                fallback_name = (course_names or [])[idx] if course_names and idx < len(course_names) else None
+                if fallback_name:
+                    aggregated_metadata["courses"].append({"name": fallback_name, "identifier": cid})
+                    logger.info(f"Injected fallback course name '{fallback_name}' for {cid}")
                 continue
                 
             # Metadata
@@ -167,41 +225,49 @@ async def generate_assessment(
                      combined_learning_objectives.append(instructions)
                 
             # Transcript (Recursive - find all english_subtitles.vtt in subfolders)
+            vtt_found = False
             for vtt_path in c_path.rglob("english_subtitles.vtt"):
                  try:
                      text = await extract_vtt_text(vtt_path)
                      if not text: continue
-                     
+
                      # Deduplication Check
                      text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
                      if text_hash in seen_content_hashes:
                          logger.info(f"Skipping duplicate VTT content: {vtt_path.name}")
                          continue
                      seen_content_hashes.add(text_hash)
-                     
+
                      rel_path = vtt_path.relative_to(c_path)
                      combined_transcript.append(f"--- SOURCE: {cid} / {rel_path} ---\n{text}")
+                     vtt_found = True
                  except Exception as e:
                      logger.warning(f"Failed to read VTT {vtt_path}: {e}")
-                
+
             # PDFs (Recursive - find all PDFs in subfolders)
+            pdf_found = False
             for pdf_file in c_path.rglob("*.pdf"):
-                 # Avoid reading the same file if multiple symlinks or structure exists
                  try:
                     text = await extract_pdf_text(pdf_file)
                     if not text: continue
-    
+
                     # Deduplication Check
                     text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
                     if text_hash in seen_content_hashes:
                         logger.info(f"Skipping duplicate PDF content: {pdf_file.name}")
                         continue
                     seen_content_hashes.add(text_hash)
-    
+
                     rel_path = pdf_file.relative_to(c_path)
                     combined_pdfs.append(f"--- SOURCE: {cid} / {rel_path} ---\n{text}")
+                    pdf_found = True
                  except Exception as e:
                      logger.warning(f"Failed to read PDF {pdf_file}: {e}")
+
+            aggregated_metadata["content_availability"][cid] = {
+                "has_vtt": vtt_found,
+                "has_pdf": pdf_found,
+            }
     else:
         if assessment_type == "competency" and competency_area:
             # No course content — build context from KCM descriptions matching the requested area/themes/sub-themes
@@ -236,13 +302,23 @@ async def generate_assessment(
 
     # Process Extra Uploaded Files (from API)
     if extra_files:
+        uploaded_vtt = False
+        uploaded_pdf = False
         for fpath in extra_files:
             if fpath.suffix.lower() == '.pdf':
                 text = await extract_pdf_text(fpath)
-                combined_pdfs.append(f"--- UPLOADED FILE: {fpath.name} ---\n{text}")
+                if text:
+                    combined_pdfs.append(f"--- UPLOADED FILE: {fpath.name} ---\n{text}")
+                    uploaded_pdf = True
             elif fpath.suffix.lower() == '.vtt':
                 text = await extract_vtt_text(fpath)
-                combined_transcript.append(f"--- UPLOADED FILE: {fpath.name} ---\n{text}")
+                if text:
+                    combined_transcript.append(f"--- UPLOADED FILE: {fpath.name} ---\n{text}")
+                    uploaded_vtt = True
+        aggregated_metadata["content_availability"]["uploaded_files"] = {
+            "has_vtt": uploaded_vtt,
+            "has_pdf": uploaded_pdf,
+        }
 
     final_transcript_str = "\n\n".join(combined_transcript) if combined_transcript else "N/A"
     final_pdf_str = "\n\n".join(combined_pdfs) if combined_pdfs else "N/A"
@@ -269,8 +345,30 @@ async def generate_assessment(
         else:
             blooms_str = "Remember: 20%, Understand: 25%, Apply: 25%, Analyze: 20%, Evaluate: 10%"
     else:
-        # User defined
-        blooms_str = ", ".join([f"{k}: {v}%" for k,v in blooms_distribution.items()])
+        # Distribute bloom levels per question type so the LLM gets unambiguous assignments.
+        # A flat numbered list is unreliable because the LLM writes questions grouped by type,
+        # not as a flat sequence — it cannot map "Question N" to the right type bucket.
+        blooms_by_type = compute_blooms_by_type(blooms_distribution, question_type_counts or {})
+        type_label_map = {
+            "mcq": "Multiple Choice Questions (MCQ)",
+            "ftb": "Fill in the Blank Questions (FTB)",
+            "mtf": "Match the Following Questions (MTF)",
+            "multichoice": "Multi-Choice Questions",
+            "truefalse": "True/False Questions",
+        }
+        lines = []
+        for qtype, levels in blooms_by_type.items():
+            label = type_label_map.get(qtype, qtype)
+            level_str = ", ".join(levels)
+            lines.append(f"     {label} ({len(levels)} questions): {level_str}")
+        blooms_str = (
+            "Per-type Bloom's assignment (NON-NEGOTIABLE):\n"
+            "     For each question type below, assign the listed Bloom's levels IN ORDER\n"
+            "     to your questions of that type. The Nth level listed = the Nth question\n"
+            "     of that type. Write the question content to genuinely reflect that level.\n"
+            + "\n".join(lines)
+        )
+        logger.info(f"Blooms by type: { {k: v for k, v in blooms_by_type.items()} }")
 
     # 3. Format Topics
     topics_str = ", ".join(topic_names) if topic_names else "None specific (Cover all modules)"
@@ -418,12 +516,15 @@ def _should_retry(e: BaseException) -> bool:
         msg = str(e).lower()
         if "cache" in msg and ("expired" in msg or "404" in msg or "not found" in msg):
             return True
+        # Retry 429 RESOURCE_EXHAUSTED — Vertex AI rate limit hit under concurrent load.
+        if "429" in msg or "resource_exhausted" in msg:
+            return True
     return False
 
 @retry(
     retry=retry_if_exception(_should_retry),
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
+    wait=wait_exponential(multiplier=2, min=5, max=30),
     reraise=True,
 )
 async def call_llm(prompt: str) -> Tuple[str, Dict[str, Any]]:
@@ -478,6 +579,8 @@ async def extract_vtt_text(vtt_path: Path) -> str:
         for line in raw.splitlines():
             line = line.strip()
             if not line or line.upper().startswith('WEBVTT') or '-->' in line or line.isdigit():
+                continue
+            if line.startswith('//'):
                 continue
             text_lines.append(line)
         return '\n'.join(text_lines)

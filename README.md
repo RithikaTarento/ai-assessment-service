@@ -96,7 +96,7 @@ For the full architecture including sequence diagrams, database schema, and cach
 1. Clone this repository.
 2. Copy `.env.example` to `.env` and fill in all required values.
 3. Place your Vertex AI service account JSON file in the root as `credentials.json`.
-4. *(Kubernetes / multi-pod only)* Place your GCS service account JSON file in the root as `gcs_credentials.json` and set `GCS_BUCKET_NAME` in `.env`.
+4. *(Kubernetes / multi-pod only)* Place your GCS service account JSON file in the root as `gcs_credentials.json` and set `GCS_BUCKET_NAME`, `GCS_COURSE_CONTENT_PREFIX` in `.env`. When `DOCUMENT_STORAGE_TYPE=gcs`, the Worker automatically caches fetched course content (VTTs, PDFs, metadata) in GCS so any pod can reuse it without re-fetching from the Learning API.
 
 ### Method 1: Docker (Recommended)
 
@@ -157,10 +157,12 @@ Copy `.env.example` to `.env` and configure:
 | `MAX_CONCURRENCY` | Max parallel generation jobs | `50` |
 | `CLEANUP_RETENTION_DAYS` | Days before auto-deletion | `7` |
 | `DISABLE_AUTH_VERIFICATION` | Bypass JWT check (dev only) | `false` |
-| `DOCUMENT_STORAGE_TYPE` | Storage backend for uploaded files — `local` (default) or `gcs` | `local` |
+| `DOCUMENT_STORAGE_TYPE` | Storage backend — `local` (default, single-node / Docker Compose) or `gcs` (Kubernetes / multi-pod) | `local` |
 | `GCS_CREDENTIALS` | Path to GCS service account JSON (only when `DOCUMENT_STORAGE_TYPE=gcs`) | `/app/gcs_credentials.json` |
 | `GCS_BUCKET_NAME` | GCS bucket name (only when `DOCUMENT_STORAGE_TYPE=gcs`) | `your-bucket-name` |
-| `GCS_UPLOAD_PREFIX` | Path prefix inside the GCS bucket | `ai-assessments/uploads` |
+| `GCS_UPLOAD_PREFIX` | GCS prefix for user-uploaded standalone files | `ai-assessments/uploads` |
+| `GCS_COURSE_CONTENT_PREFIX` | GCS prefix for fetched course content (VTT, PDF, metadata) — persisted permanently for cross-pod reuse | `ai-assessments/course-content` |
+| `GCS_OUTPUT_PREFIX` | GCS prefix reserved for future output storage | `ai-assessments/outputs` |
 
 ---
 
@@ -199,7 +201,14 @@ The API is the production-ready, event-driven iteration. It introduces **Authent
 
 ### 2. Check Status
 - **Endpoint**: `GET /ai-assessments/status/{job_id}`
-- **Response**: Returns `status` (`PENDING`, `IN_PROGRESS`, `COMPLETED`, `FAILED`). When `COMPLETED`, includes the full `assessment_data` object.
+- **Response**: Returns `status` (`PENDING`, `IN_PROGRESS`, `COMPLETED`, `FAILED`). When `COMPLETED`, includes the full `assessment_data` object and a `metadata` object.
+
+The `metadata` object includes:
+- `config` — all generation parameters (`assessment_type`, `difficulty`, `language`, `total_questions`, `question_type_counts`, `enable_blooms`, `blooms_config`, `topic_names`, `additional_instructions`, `time_limit`, `course_weightage`, `competency_area`, `competency_themes`, `competency_sub_themes`)
+- `content_availability` — indicates whether VTT and PDF content was found during generation:
+  - For course-based jobs: `{ "<course_id>": { "has_vtt": true, "has_pdf": false } }`
+  - For standalone (uploaded files): `{ "uploaded_files": { "has_vtt": true, "has_pdf": true } }`
+  - `has_vtt: false` when the VTT file exists but contains no subtitle content (placeholder only)
 
 ### 3. Edit Assessment
 - **Endpoint**: `PUT /ai-assessments/update/{job_id}`

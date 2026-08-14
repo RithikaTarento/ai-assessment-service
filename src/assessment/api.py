@@ -1,5 +1,6 @@
 import os
 import shutil
+import tempfile
 import logging
 import json
 from pathlib import Path
@@ -205,7 +206,9 @@ async def generate_v1(
     b_dist = None
     if blooms_config:
         try:
-            b_dist = json.loads(blooms_config)
+            raw = json.loads(blooms_config)
+            # Normalize keys to title-case for internal storage and computation
+            b_dist = {k.capitalize(): v for k, v in raw.items()}
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON for blooms_config")
 
@@ -352,6 +355,18 @@ async def check_status_v1(job_id: str, user_id: str = Depends(get_current_user))
         logger.warning(f"[{job_id}] Status check — access denied | requester={user_id} | owner={status.get('user_id')}")
         raise HTTPException(status_code=403, detail="Access denied: you do not own this assessment")
     logger.info(f"[{job_id}] Status check — current status={status.get('status')}")
+
+    # Lowercase blooms_config keys in the response to match generate endpoint format
+    meta = status.get("metadata") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    config = meta.get("config") or {}
+    if "blooms_config" in config and isinstance(config["blooms_config"], dict):
+        config["blooms_config"] = {k.lower(): v for k, v in config["blooms_config"].items()}
+
     return status
 
 from pydantic import BaseModel
@@ -396,6 +411,7 @@ SUPPORTED_FORMATS = {"csv", "csv_basic", "json", "pdf", "docx"}
 async def download_assessment_v1(
     job_id: str,
     format: str,
+    background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user)
 ):
     logger.info(f"[{job_id}] Download request | format={format} | user={user_id}")
@@ -416,32 +432,33 @@ async def download_assessment_v1(
         raise HTTPException(status_code=403, detail="Access denied: you do not own this assessment")
 
     assessment_json = data['assessment_data']
-    base_path = Path(INTERACTIVE_COURSES_PATH)
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"assessment_{job_id}_"))
+    background_tasks.add_task(shutil.rmtree, str(tmp_dir), True)
     logger.info(f"[{job_id}] Generating {format} export | user={user_id}")
 
     if format == "csv":
-        path = base_path / f"{job_id}_assessment_v2.csv"
+        path = tmp_dir / f"{job_id}_assessment_v2.csv"
         generate_csv_v2(assessment_json, path)
         return FileResponse(path, filename=f"{job_id}_assessment.csv", media_type="text/csv")
 
     elif format == "csv_basic":
-        path = base_path / f"{job_id}_assessment_basic.csv"
+        path = tmp_dir / f"{job_id}_assessment_basic.csv"
         generate_csv_basic(assessment_json, path)
         return FileResponse(path, filename=f"{job_id}_assessment_basic.csv", media_type="text/csv")
 
     elif format == "json":
-        path = base_path / f"{job_id}_assessment_v2.json"
+        path = tmp_dir / f"{job_id}_assessment_v2.json"
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(assessment_json, f, indent=2, ensure_ascii=False)
         return FileResponse(path, filename=f"{job_id}_assessment.json", media_type="application/json")
 
     elif format == "pdf":
-        path = base_path / f"{job_id}_assessment_v2.pdf"
+        path = tmp_dir / f"{job_id}_assessment_v2.pdf"
         generate_pdf(assessment_json, path)
         return FileResponse(path, filename=f"{job_id}_assessment.pdf", media_type="application/pdf")
 
     elif format == "docx":
-        path = base_path / f"{job_id}_assessment_v2.docx"
+        path = tmp_dir / f"{job_id}_assessment_v2.docx"
         generate_docx(assessment_json, path)
         return FileResponse(path, filename=f"{job_id}_assessment.docx", media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 

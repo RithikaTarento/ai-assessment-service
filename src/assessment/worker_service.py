@@ -92,6 +92,7 @@ async def process_job(payload: Dict[str, Any]):
             competency_area=payload.get('competency_area'),
             competency_themes=payload.get('competency_themes'),
             competency_sub_themes=payload.get('competency_sub_themes'),
+            course_names=payload.get('course_names', []),
         )
         llm_duration = round(time.monotonic() - t_llm, 2)
         input_tokens = usage.get('prompt_token_count', 'N/A') if usage else 'N/A'

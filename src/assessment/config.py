@@ -49,6 +49,8 @@ DOCUMENT_STORAGE_TYPE = os.getenv("DOCUMENT_STORAGE_TYPE", "local")
 GCS_CREDENTIALS = os.getenv("GCS_CREDENTIALS")
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "")
 GCS_UPLOAD_PREFIX = os.getenv("GCS_UPLOAD_PREFIX", "ai-assessments/uploads")
+GCS_COURSE_CONTENT_PREFIX = os.getenv("GCS_COURSE_CONTENT_PREFIX", "ai-assessments/course-content")
+GCS_OUTPUT_PREFIX = os.getenv("GCS_OUTPUT_PREFIX", "ai-assessments/outputs")
 
 # Headers for Karmayogi API
 if not KARMAYOGI_API_KEY:

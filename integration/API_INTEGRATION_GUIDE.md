@@ -235,21 +235,66 @@ curl --location 'https://portal.uat.karmayogibharat.net/apis/proxies/v8/ai/asses
 {
   "job_id": "do_1144540583527301121908_7fa321bd_1e8b6826-3326-4175-b202-f5f5971f457a",
   "status": "COMPLETED",
-  "assessment_data": {
-    "title": "Course Assessment",
-    "questions": [
-      {
-        "id": 1,
-        "type": "mcq",
-        "question": "What is the primary purpose of ...?",
-        "options": ["Option A", "Option B", "Option C", "Option D"],
-        "correct_answer": "Option A",
-        "explanation": "Option A is correct because ...",
-        "bloom_level": "Understand",
-        "difficulty": "intermediate",
-        "topic": "Introduction"
+  "metadata": {
+    "config": {
+      "assessment_type": "practice",
+      "difficulty": "intermediate",
+      "language": "english",
+      "total_questions": 10,
+      "question_type_counts": { "mcq": 5, "ftb": 5, "mtf": 0, "multichoice": 0, "truefalse": 0 },
+      "enable_blooms": true,
+      "blooms_config": { "Remember": 20, "Understand": 30, "Apply": 30, "Analyze": 10, "Evaluate": 10, "Create": 0 },
+      "topic_names": null,
+      "additional_instructions": null,
+      "time_limit": null,
+      "course_weightage": null,
+      "competency_area": null,
+      "competency_themes": null,
+      "competency_sub_themes": null
+    },
+    "content_availability": {
+      "do_1144540583527301121908": {
+        "has_vtt": true,
+        "has_pdf": false
       }
-    ]
+    }
+  },
+  "assessment_data": {
+    "blueprint": { "...": "..." },
+    "questions": {
+      "Multiple Choice Question": [
+        {
+          "course_name": "Foundations of Public Policy",
+          "question_text": "What is the primary purpose of ...?",
+          "options": [
+            { "text": "Option A" },
+            { "text": "Option B" },
+            { "text": "Option C" },
+            { "text": "Option D" }
+          ],
+          "correct_option_index": 0,
+          "blooms_level": "Understand",
+          "answer_rationale": {
+            "correct_answer_explanation": "Option A is correct because ...",
+            "why_factor": "...",
+            "logic_justification": "..."
+          },
+          "reasoning": {
+            "learning_objective_alignment": "...",
+            "competency_alignment": { "kcm": { "competency_area": "...", "competency_theme": "...", "competency_sub_theme": "..." } },
+            "blooms_level_justification": "...",
+            "difficulty_justification": "...",
+            "question_type_rationale": "...",
+            "assessment_type_relevance": "..."
+          },
+          "relevance_percentage": 92
+        }
+      ],
+      "FTB Question": [],
+      "MTF Question": [],
+      "Multi-Choice Question": [],
+      "True/False Question": []
+    }
   },
   "error_message": null
 }
@@ -261,22 +306,23 @@ curl --location 'https://portal.uat.karmayogibharat.net/apis/proxies/v8/ai/asses
 |---|---|
 | `job_id` | The assessment job ID |
 | `status` | `PENDING`, `IN_PROGRESS`, `COMPLETED`, or `FAILED` |
-| `assessment_data` | `null` until complete. On completion, contains `title` and `questions` array. |
+| `metadata.config` | All generation parameters used for this job — `assessment_type`, `difficulty`, `language`, `total_questions`, `question_type_counts`, `enable_blooms`, `blooms_config`, `topic_names`, `additional_instructions`, `time_limit`, `course_weightage`, `competency_area`, `competency_themes`, `competency_sub_themes` |
+| `metadata.content_availability` | Per-course VTT and PDF availability. For course-based jobs: `{ "<course_id>": { "has_vtt": true, "has_pdf": false } }`. For standalone uploads: `{ "uploaded_files": { "has_vtt": true, "has_pdf": true } }`. `has_vtt: false` when the VTT file exists but contains no subtitle content. |
+| `assessment_data` | `null` until complete. On completion contains `blueprint` and `questions` keyed by type. |
 | `error_message` | `null` on success. Contains error details if `status` is `FAILED`. |
 
 #### Question Object Fields
 
 | Field | Description |
 |---|---|
-| `id` | Sequential question number |
-| `type` | `mcq`, `ftb`, `mtf`, `multichoice`, or `truefalse` |
-| `question` | The question text |
-| `options` | List of answer choices (not present for `ftb`) |
-| `correct_answer` | The correct answer or answer key |
-| `explanation` | Explanation of why the answer is correct |
-| `bloom_level` | Bloom's taxonomy level: `Remember`, `Understand`, `Apply`, `Analyze`, `Evaluate`, or `Create` |
-| `difficulty` | `beginner`, `intermediate`, or `advanced` |
-| `topic` | The topic within the course this question covers |
+| `course_name` | The course this question is derived from. `"User Uploaded Content"` for standalone assessments. |
+| `question_text` | The question text (MTF uses `matching_context` instead) |
+| `options` | List of `{ "text": "..." }` answer choices |
+| `correct_option_index` | Zero-based index of the correct option (MCQ) |
+| `blooms_level` | `Remember`, `Understand`, `Apply`, `Analyze`, `Evaluate`, or `Create` |
+| `answer_rationale` | `correct_answer_explanation`, `why_factor`, `logic_justification` |
+| `reasoning` | `learning_objective_alignment`, `competency_alignment` (KCM area/theme/sub-theme), `blooms_level_justification`, `difficulty_justification`, `question_type_rationale`, `assessment_type_relevance` |
+| `relevance_percentage` | 0–100 confidence score based on LO alignment (35%), competency fit (30%), Bloom's match (20%), assessment fit (15%) |
 
 ---
 
