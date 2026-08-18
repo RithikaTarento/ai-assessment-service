@@ -67,10 +67,10 @@ The result is available in JSON, CSV (for import into the LMS), PDF, and DOCX fo
 └──────────┬──────────────────────────────────────┬────────────┘
            │                                      │
            ▼                                      ▼
-  ┌─────────────────┐                   ┌──────────────────────┐
-  │   PostgreSQL    │                   │  Karmayogi Learning  │
-  │  (jobs table)   │                   │  API  (VTT / PDF)    │
-  └─────────────────┘                   └──────────────────────┘
+  ┌───────────────────────────┐         ┌──────────────────────┐
+  │        PostgreSQL         │         │  Karmayogi Learning  │
+  │ (interactive_assessments) │         │  API  (VTT / PDF)    │
+  └───────────────────────────┘         └──────────────────────┘
 ```
 
 **Three moving pieces:**
@@ -104,7 +104,7 @@ Client  ──► API  ──► Kafka  ──► Worker  ──► DB
    └───────────  poll /status ◄─────────────┘
 ```
 
-1. **API** receives the request, validates it, writes a `PENDING` job to the DB, drops a message on Kafka, and returns `202 Accepted` with a `job_id` **in under 100ms**.
+1. **API** receives the request, validates it, writes a `PENDING` job to the DB, drops a message on Kafka, and returns `200 OK` with a `job_id` and `status: PENDING` **in under 100ms**. (The response is always `200`; the `status` field — not the HTTP code — tells the client whether work was queued or served from cache.)
 2. **Client** polls `/status/{job_id}` every few seconds.
 3. **Worker** is a completely separate process. It reads from Kafka, does all the slow work (fetch → LLM → parse → save), and writes the final result back to the DB.
 4. When the client's next poll hits, the status is `COMPLETED` and the data is there.
@@ -122,7 +122,7 @@ Client  ──► API  ──► Kafka  ──► Worker  ──► DB
 
 ### In Kubernetes
 
-The API and Worker are deployed as **separate Deployments** with separate Docker images (`Dockerfile` vs `DockerfileWorker`). They share only:
+The API and Worker are deployed as **separate Deployments** built from separate Dockerfiles (`Dockerfile` vs `DockerfileWorker`) by the Jenkins pipelines. Locally, `docker-compose` builds **both** services from the root `Dockerfile` and varies only the `command` — the two Dockerfiles currently differ only in `EXPOSE` and `CMD`. They share only:
 - The same PostgreSQL database
 - The same Kafka broker
 - The same GCS bucket (for file storage in multi-pod setups)
@@ -143,7 +143,8 @@ The API and Worker are deployed as **separate Deployments** with separate Docker
   │                   │── INSERT job ──────────────────────────────────────────►│
   │                   │   status=PENDING   │                  │                 │
   │                   │── publish msg ────►│                  │                 │
-  │◄── 202 job_id ────│                   │                  │                 │
+  │◄── 200 job_id ────│                   │                  │                 │
+  │    status=PENDING │                   │                  │                 │
   │                   │                   │── deliver msg ──►│                 │
   │                   │                   │                  │── fetch VTT/PDF  │
   │                   │                   │                  │── call Gemini    │
@@ -217,14 +218,14 @@ ai-assessment-service/
 │       ├── storage.py               ← Abstraction: local disk vs GCS
 │       ├── tracing.py               ← Langfuse observability (opt-in)
 │       ├── exporters.py             ← PDF & DOCX generation
-│       ├── exporters_csv_v2.py      ← CSV export (7-option V2 schema)
-│       ├── cleanup.py               ← Scheduled old-record deletion
+│       ├── exporters_csv_v2.py      ← CSV export (7-option V2 + basic MCQ schema)
+│       ├── cleanup.py               ← Scheduled deletion of old cached files
 │       ├── config.py                ← All env var loading
 │       └── resources/
 │           ├── prompts.yaml         ← LLM system & user prompt templates
 │           ├── schemas.json         ← JSON schema for LLM output validation
-│           ├── competencies.json    ← KCM competency index (110 competencies)
-│           ├── kcm_descriptions.json← Full KCM text (~60k tokens, Gemini-cached)
+│           ├── competencies.json    ← KCM index: 2 areas / 35 themes / 112 sub-themes
+│           ├── kcm_descriptions.json← Full KCM text, 109 entries (~60k tokens, Gemini-cached)
 │           └── fonts/               ← Noto Sans fonts for Indian language PDFs
 │
 ├── ui/
@@ -340,11 +341,11 @@ Converts the assessment JSON into downloadable documents.
 #### `exporters_csv_v2.py` — CSV export
 Generates CSV files in the iGot platform's 7-option import schema.
 
-- `generate_csv_v2()` — full schema with QuestionTagging column (all question types)
-- `generate_csv_basic()` — simplified schema (MCQ/FTB only, no T/F)
+- `generate_csv_v2()` — full 7-option schema with `QuestionType` / `QuestionTagging` columns, all question types, `Yes`/`No` correctness values
+- `generate_csv_basic()` — 6-option schema, **MCQ only** (single- and multi-answer); FTB, MTF and True/False are skipped entirely. Columns are `SR`, `Question`, `Option1`–`Option6`, `IsOption1Correct`–`IsOption6Correct`, with `TRUE`/`FALSE` correctness values
 
 #### `cleanup.py` — Scheduled maintenance
-APScheduler job that runs daily to delete old completed assessments from the DB. Retention period configured via `CLEANUP_RETENTION_DAYS` (default: 7 days).
+APScheduler job that runs daily and **deletes files from disk — it does not touch the database**. It scans the top level of `INTERACTIVE_COURSES_PATH` and removes any entry whose mtime is older than `CLEANUP_RETENTION_DAYS` (default: 7 days), reclaiming cached course content. Job rows in PostgreSQL are never deleted. Schedule configured via `CLEANUP_SCHEDULE_HOUR` / `CLEANUP_SCHEDULE_MINUTE` (default: 03:00).
 
 #### `config.py` — Environment variable registry
 Single source of truth for all configuration. Loads `.env` at import time. If you add a new env var anywhere, add it here first.
@@ -356,7 +357,7 @@ All system and user prompt templates. Versioned (`version` key). Changing prompt
 JSON schema that constrains the LLM's output format. Passed to Gemini as the `response_schema` to enforce structured JSON. Changing this requires matching changes in `generator.py`'s parsing logic.
 
 #### `resources/kcm_descriptions.json` — KCM competency data
-Full text of all 110 Karmayogi Competency Model competencies (~60k tokens). This file is loaded once and cached in Gemini's context cache to avoid re-sending it with every request.
+Full text of the Karmayogi Competency Model — 109 entries (~60k tokens), each with `Label`, `Area`, `Description` and `Levels`. This file is loaded once and cached in Gemini's context cache to avoid re-sending it with every request. (The separate `competencies.json` is the smaller structured index: 2 areas → 35 themes → 112 sub-themes, injected into the prompt directly.)
 
 ---
 
@@ -377,6 +378,7 @@ Copy `.env.example` → `.env` and fill in values. **Never commit `.env`.**
 | `KAFKA_BOOTSTRAP_SERVERS` | Both | `localhost:29092` (local) or `kafka:9092` (Docker) |
 | `KAFKA_REQUEST_TOPIC` | Both | Topic for generation requests |
 | `KAFKA_TOPIC` | Both | Topic for completion events |
+| `KAFKA_GROUP_ID` | Worker | Consumer group ID (default `assessment_worker_group`) |
 | `GOOGLE_PROJECT_ID` | Worker | GCP project ID |
 | `GOOGLE_LOCATION` | Worker | Vertex AI region (e.g. `us-central1`) |
 | `GENAI_MODEL_NAME` | Worker | Gemini model (e.g. `gemini-2.5-pro`) |
@@ -384,13 +386,18 @@ Copy `.env.example` → `.env` and fill in values. **Never commit `.env`.**
 | `DOCUMENT_STORAGE_TYPE` | Both | `local` (default) or `gcs` |
 | `GCS_CREDENTIALS` | Both (GCS only) | Path to GCS service account JSON |
 | `GCS_BUCKET_NAME` | Both (GCS only) | GCS bucket name |
-| `INTERACTIVE_COURSES_PATH` | Worker | Local path for course content cache |
+| `GCS_UPLOAD_PREFIX` | Both (GCS only) | Prefix for user-uploaded files (default `ai-assessments/uploads`) |
+| `GCS_COURSE_CONTENT_PREFIX` | Worker (GCS only) | Prefix for fetched course VTT/PDF/metadata (default `ai-assessments/course-content`) |
+| `GCS_OUTPUT_PREFIX` | — | Loaded by `config.py` but currently unused |
+| `INTERACTIVE_COURSES_PATH` | Both | Course content cache **and** the local storage root — the API writes uploads and runs cleanup here too |
 | `LANGFUSE_ENABLED` | Worker | `true` to enable LLM tracing |
 | `LANGFUSE_PUBLIC_KEY` | Worker | Langfuse project public key |
 | `LANGFUSE_SECRET_KEY` | Worker | Langfuse project secret key |
 | `LANGFUSE_HOST` | Worker | Langfuse host URL |
 | `LANGFUSE_SAMPLE_RATE` | Worker | Fraction of traces to send (0.0–1.0) |
-| `CLEANUP_RETENTION_DAYS` | API | Days before old jobs are deleted |
+| `CLEANUP_RETENTION_DAYS` | API | Days before old cached **files** are deleted from disk (default `7`) |
+| `CLEANUP_SCHEDULE_HOUR` | API | Hour the daily cleanup runs (default `3`) |
+| `CLEANUP_SCHEDULE_MINUTE` | API | Minute the daily cleanup runs (default `0`) |
 
 ---
 
@@ -486,15 +493,29 @@ Key form fields:
 | `force` | bool | ❌ | `true` bypasses cache and forces new generation |
 | `files` | file | ✅* | PDF/VTT files (\*required for `standalone`) |
 
-**Response — new job (202):**
+**All `/generate` responses are `200 OK`** — branch on the `status` field, not the HTTP status code.
+
+**Response — new job queued:**
 ```json
-{ "message": "Generation started", "status": "PENDING", "job_id": "abc123" }
+{ "message": "Generation started (Queued)", "status": "PENDING", "job_id": "abc123" }
 ```
 
-**Response — cache hit (200):**
+**Response — cache hit (this user already has it):**
 ```json
-{ "status": "COMPLETED", "job_id": "abc123", "assessment_data": { ... } }
+{ "message": "Assessment retrieved from cache", "status": "COMPLETED", "job_id": "abc123", "result": { ... } }
 ```
+
+**Response — clone (another user had the same params):**
+```json
+{ "message": "Assessment cloned from cache", "status": "COMPLETED", "job_id": "abc123", "result": { ... } }
+```
+
+**Response — already running:**
+```json
+{ "message": "Assessment generation in progress", "status": "IN_PROGRESS", "job_id": "abc123" }
+```
+
+> **Note**: the completed assessment is returned under `result` here, but under `assessment_data` by `GET /status/{job_id}`. The two keys carry the same object.
 
 ### GET /status/{job_id}
 
@@ -585,44 +606,46 @@ Restart the Worker. Traces appear immediately on next generation job.
 
 ## 12. Database Schema
 
-Single table: `assessment_jobs`
+Single table: `interactive_assessments`, created by `db.py` at startup (`CREATE TABLE IF NOT EXISTS`).
 
 | Column | Type | Description |
 |---|---|---|
-| `job_id` | TEXT PRIMARY KEY | Deterministic hash of generation params + user_id |
-| `user_id` | TEXT | Owner (from JWT) |
+| `course_id` | TEXT PRIMARY KEY | **The job ID**, despite the column name — format `{base_id}_{param_hash}_{user_id}` |
+| `user_id` | TEXT | Owner (from JWT). Nullable, for v1 compatibility |
 | `status` | TEXT | `PENDING` / `IN_PROGRESS` / `COMPLETED` / `FAILED` |
-| `created_at` | TIMESTAMPTZ | Job creation time |
-| `updated_at` | TIMESTAMPTZ | Last status change |
+| `created_at` | TIMESTAMP | Job creation time (timezone-naive) |
+| `updated_at` | TIMESTAMP | Last status change (timezone-naive) |
 | `metadata` | JSONB | Config, course IDs/names, content_availability |
 | `assessment_data` | JSONB | Full LLM output (blueprint + questions) |
-| `usage` | JSONB | Token counts from Gemini (prompt / candidates / thoughts / total) |
+| `token_usage` | JSONB | Token counts from Gemini (prompt / candidates / thoughts / total) |
 | `error_message` | TEXT | Set on FAILED jobs |
+
+> **Watch the column names.** The primary key is `course_id` but it stores the full composite job ID, not a bare Karmayogi course ID — legacy naming from v1. `GET /history` aliases it back with `SELECT course_id AS job_id`, which is why the API speaks `job_id` while the table stores `course_id`. Likewise the token column is `token_usage`, not `usage`. `GET /status/{job_id}` returns the raw row, so its response carries `course_id` and `token_usage` too.
 
 ### Useful queries
 
 ```sql
 -- All jobs by status
-SELECT status, COUNT(*) FROM assessment_jobs GROUP BY status;
+SELECT status, COUNT(*) FROM interactive_assessments GROUP BY status;
 
 -- Recent completed jobs with course and config info
 SELECT
-  job_id,
+  course_id AS job_id,
   user_id,
   created_at,
   metadata->>'course_names'              AS course_names,
   metadata->'config'->>'assessment_type' AS type,
   metadata->'config'->>'difficulty'      AS difficulty,
   metadata->'config'->>'total_questions' AS questions,
-  usage->>'total_token_count'            AS total_tokens
-FROM assessment_jobs
+  token_usage->>'total_token_count'      AS total_tokens
+FROM interactive_assessments
 WHERE status = 'COMPLETED'
 ORDER BY created_at DESC
 LIMIT 20;
 
 -- Failed jobs with error
-SELECT job_id, user_id, created_at, error_message
-FROM assessment_jobs
+SELECT course_id AS job_id, user_id, created_at, error_message
+FROM interactive_assessments
 WHERE status = 'FAILED'
 ORDER BY created_at DESC;
 ```
@@ -634,8 +657,8 @@ ORDER BY created_at DESC;
 | Format | Endpoint param | Contents |
 |---|---|---|
 | `json` | `format=json` | Raw LLM output — blueprint + all question types |
-| `csv` | `format=csv` | iGot 7-option import schema with QuestionTagging (all types) |
-| `csv_basic` | `format=csv_basic` | Simplified schema (MCQ/FTB only) |
+| `csv` | `format=csv` | iGot 7-option import schema with QuestionTagging (all types), `Yes`/`No` correctness |
+| `csv_basic` | `format=csv_basic` | 6-option schema, **MCQ only** (single + multi answer). FTB / MTF / True-False rows are omitted. `TRUE`/`FALSE` correctness, no QuestionType or QuestionTagging columns |
 | `pdf` | `format=pdf` | Formatted PDF with Indian language font support |
 | `docx` | `format=docx` | Word document |
 

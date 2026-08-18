@@ -21,7 +21,7 @@ graph TD
     end
 
     subgraph "Persistence"
-        API & Worker --> DB[("PostgreSQL<br/>assessment_jobs")]
+        API & Worker --> DB[("PostgreSQL<br/>interactive_assessments")]
         API & Worker --> FileStorage["Storage Layer<br/>(local disk / GCS)"]
     end
 
@@ -38,6 +38,8 @@ graph TD
 ## 2. End-to-End Request Flow
 
 Assessment generation is fully asynchronous. The API responds in under 100ms; clients poll for the result.
+
+**Every `/generate` response is HTTP `200`** — the `status` field (`PENDING` / `IN_PROGRESS` / `COMPLETED`) tells the client what happened, not the status code. A job that is already running returns `200` with `status: IN_PROGRESS` and no payload.
 
 ```mermaid
 sequenceDiagram
@@ -56,16 +58,16 @@ sequenceDiagram
     API->>DB: SELECT by job_id (own cache check)
     alt Own cache hit — already COMPLETED
         DB-->>API: Return existing record
-        API-->>User: 200 OK + assessment_data
+        API-->>User: 200 OK + status=COMPLETED + result
     else Template hit — same params, different user
         API->>DB: SELECT by hash prefix (any user)
         DB-->>API: Found completed template
         API->>DB: INSERT clone for current user_id
-        API-->>User: 200 OK + assessment_data (cloned)
+        API-->>User: 200 OK + status=COMPLETED + result (cloned)
     else New request
         API->>DB: INSERT job (status=PENDING)
         API->>Kafka: Publish to assessment.request topic
-        API-->>User: 202 Accepted + job_id
+        API-->>User: 200 OK + status=PENDING + job_id
 
         Kafka->>Worker: Deliver message
         Worker->>DB: UPDATE status=IN_PROGRESS
@@ -128,7 +130,7 @@ The final prompt sent to Gemini has three layers:
 │  • Output schema instructions                            │
 ├─────────────────────────────────────────────────────────┤
 │  KCM Context  (from Gemini Context Cache)                │
-│  • 110 Karmayogi Competency Model definitions            │
+│  • 109 Karmayogi Competency Model definitions            │
 │  • ~60k tokens — cached; NOT re-sent per request         │
 ├─────────────────────────────────────────────────────────┤
 │  User Context  (built per request)                       │
@@ -152,7 +154,7 @@ No per-type ceilings exist — only the user's percentage and the total question
 
 ### 4.4 Gemini Context Caching (KCM)
 
-The 110 KCM competency definitions (~60k tokens) are uploaded to Gemini's context cache at Worker startup. Each LLM call connects to the active cache ID instead of re-sending the full KCM text. This reduces per-request token costs and latency significantly.
+The 109 KCM competency definitions (~60k tokens) are uploaded to Gemini's context cache at Worker startup. Each LLM call connects to the active cache ID instead of re-sending the full KCM text. This reduces per-request token costs and latency significantly.
 
 ### 4.5 Assessment Types
 
@@ -197,17 +199,32 @@ Both API (for uploaded files) and Worker (for fetched course content) use the sa
 ### Course content cache layout
 
 ```
-interactive_courses_data/       (or GCS_COURSE_CONTENT_PREFIX in GCS)
-├── {course_id}/
-│   ├── metadata.json           ← course name, description, learning objectives
-│   ├── {module_id}/
-│   │   ├── handout.pdf
-│   │   └── {resource_id}/
-│   │       └── en/
-│   │           └── transcript.vtt
-└── storage_downloads/
-    └── {job_id}/               ← standalone uploaded files (temp, cleaned after job)
+interactive_courses_data/            (INTERACTIVE_COURSES_PATH — also the local storage root)
+│
+├── {course_id}/                     ← root course node, written by fetcher.process_node()
+│   ├── metadata.json                ← name, description, keywords, instructions (learning objectives)
+│   ├── pdf_links.txt                ← "<pdf name> - <source url>" line per PDF attempted
+│   ├── english_subtitles.vtt        ← every English VTT on this node, concatenated
+│   ├── {sanitized pdf name}.pdf     ← one file per PDF found on this node
+│   ├── {sanitized video name}/
+│   │   └── en/
+│   │       └── {original vtt filename}.vtt
+│   └── {leaf_node_id}/              ← one per entry in the course's leafNodes[]
+│       ├── metadata.json            ← same four file kinds repeat inside each leaf
+│       ├── pdf_links.txt
+│       ├── english_subtitles.vtt
+│       └── {sanitized video name}/en/*.vtt
+│
+├── uploads/{job_id}/                ← files uploaded to /generate (API, local backend only)
+└── storage_downloads/{job_id}/      ← Worker's local copy of those uploads
 ```
+
+Two details that matter when debugging:
+
+- **The generator only reads `english_subtitles.vtt` and `*.pdf`**, found by `rglob` across the whole course tree — the per-video `en/*.vtt` files are raw copies kept for reference and are never read during generation. Content is de-duplicated by MD5, so the same transcript appearing at both root and leaf level is only sent once.
+- **Video folders are named after the sanitized video title**, not a resource ID, so renaming a video in Karmayogi produces a new folder on the next fetch.
+
+In GCS mode, only the `{course_id}/` subtree is mirrored (under `GCS_COURSE_CONTENT_PREFIX`); uploads go to `GCS_UPLOAD_PREFIX` instead of `uploads/`.
 
 If `metadata.json` already exists for a course, the fetch phase is skipped entirely on subsequent jobs.
 
@@ -270,21 +287,23 @@ Only the **Worker** needs these vars. The API has no LLM calls and no Langfuse i
 
 ## 7. Database Design
 
-Single table: `assessment_jobs`. Uses `asyncpg` for async PostgreSQL access with connection pooling.
+Single table: `interactive_assessments`, created by `db.py` at startup. Uses `asyncpg` for async PostgreSQL access with connection pooling (min 5 / max 20, 30-minute idle recycle).
 
 ### Schema
 
 | Column | Type | Description |
 |---|---|---|
-| `job_id` | `TEXT` PRIMARY KEY | Deterministic: `{hash_of_params}_{user_id}` |
-| `user_id` | `TEXT` | Owner — extracted from JWT |
+| `course_id` | `TEXT` PRIMARY KEY | The job ID: `{base_id}_{param_hash}_{user_id}` — see note below |
+| `user_id` | `TEXT` | Owner — extracted from JWT. Nullable, for v1 compatibility |
 | `status` | `TEXT` | `PENDING` / `IN_PROGRESS` / `COMPLETED` / `FAILED` |
 | `metadata` | `JSONB` | Config, course IDs, course names, content availability per course |
 | `assessment_data` | `JSONB` | Full LLM output — blueprint + all question types |
-| `usage` | `JSONB` | Token counts: prompt / candidates / thoughts / total |
+| `token_usage` | `JSONB` | Token counts: prompt / candidates / thoughts / total |
 | `error_message` | `TEXT` | Set on `FAILED` jobs |
-| `created_at` | `TIMESTAMPTZ` | Job creation time |
-| `updated_at` | `TIMESTAMPTZ` | Last status change time |
+| `created_at` | `TIMESTAMP` | Job creation time — timezone-naive, `DEFAULT NOW()` |
+| `updated_at` | `TIMESTAMP` | Last status change time — timezone-naive |
+
+> **Column naming is legacy.** The primary key is called `course_id` but holds the full composite job ID, not a Karmayogi course ID; `get_user_assessments_history()` aliases it back with `SELECT course_id AS job_id`. The token column is `token_usage`, not `usage`. `GET /status/{job_id}` returns the raw row, so both names surface in that response.
 
 ### Caching and Clone Strategy
 
@@ -381,9 +400,11 @@ WeasyPrint renders HTML+CSS to PDF, chosen specifically for Indian script suppor
 
 | Image | Built from | Runs |
 |---|---|---|
-| API | `Dockerfile` | FastAPI + Uvicorn on port 8000. No LLM dependencies. |
-| Worker | `DockerfileWorker` | Long-running Kafka consumer. Includes `google-genai`, Vertex AI credentials. |
+| API | `Dockerfile` (via `build.sh` / `Jenkinsfile`) | FastAPI + Uvicorn on port 8000 |
+| Worker | `DockerfileWorker` (via `build-worker.sh` / `JenkinsfileWorker`) | Long-running Kafka consumer |
 | UI | `ui/Dockerfile` | Streamlit on port 8501. Talks to API via internal Docker network. |
+
+**Both images contain the same dependencies.** There is a single `pyproject.toml`, so `google-genai` and the Vertex AI SDK are installed in the API image too; `Dockerfile` and `DockerfileWorker` currently differ only in `EXPOSE` and `CMD`. The API/Worker separation is enforced at the **code** level — `api.py` never imports `generator.py` and makes no LLM calls — not by the image contents. Only the Worker needs Vertex AI credentials mounted at runtime.
 
 ### Local Docker Compose stack
 
@@ -392,6 +413,8 @@ docker-compose up --build
 ```
 
 Starts: PostgreSQL + Kafka + Zookeeper + API + Worker + Streamlit UI.
+
+Note that `docker-compose.yml` builds **both** the `api` and `worker` services from the root `Dockerfile` (`build: .`) and distinguishes them only by `command`. `DockerfileWorker` is used exclusively by the Jenkins/Kubernetes build path.
 
 ### Kubernetes
 
@@ -417,7 +440,7 @@ Starts: PostgreSQL + Kafka + Zookeeper + API + Worker + Streamlit UI.
 
 | Method | Endpoint | Behaviour |
 |---|---|---|
-| `POST` | `/generate` | Enqueues job; returns 202 (new) or 200 (cached/cloned) |
+| `POST` | `/generate` | Enqueues job. Always returns 200 — `status` is `PENDING` (new), `IN_PROGRESS` (already running) or `COMPLETED` (cached/cloned, payload under `result`) |
 | `GET` | `/status/{job_id}` | Returns status + full result when COMPLETED |
 | `PUT` | `/update/{job_id}` | Owner-only edit of assessment_data |
 | `GET` | `/history` | All jobs by the authenticated user |
@@ -447,26 +470,45 @@ multipart/form-data fields:
 
 ### Output structure
 
+Defined by `resources/schemas.json` and enforced by Gemini as `response_schema`. The two top-level keys are `blueprint` and `questions`.
+
 ```json
 {
   "blueprint": {
     "assessment_scope_summary": "...",
-    "smart_learning_objectives": ["..."],
+    "courses_covered": ["Course Name"],
     "unified_competency_map": {
       "functional": ["Financial Acumen"],
-      "behavioral": ["Accountability"]
+      "behavioral": ["Accountability"],
+      "domain": ["Public Finance"]
     },
+    "module_structure": "...",
+    "smart_learning_objectives": ["..."],
     "blooms_taxonomy_mapping": {"Remember": "20%", "Analyze": "30%"},
-    "time_appropriateness_validation": "Validated for 30 minutes."
+    "difficulty_distribution": "...",
+    "question_type_suitability": "...",
+    "evaluation_passing_policy": "...",
+    "time_appropriateness_validation": "Validated for 30 minutes.",
+    "prompt_version": "4.1",
+    "api_version": "api/v1"
   },
   "questions": {
     "Multiple Choice Question": [
       {
-        "course_name": "...",
+        "question_id": "Q1",
+        "question_type": "MCQ",
         "question_text": "...",
-        "options": [{"text": "A"}, {"text": "B"}, {"text": "C"}, {"text": "D"}],
-        "correct_option_index": 1,
+        "options": [
+          {"text": "A", "index": 1},
+          {"text": "B", "index": 2},
+          {"text": "C", "index": 3},
+          {"text": "D", "index": 4}
+        ],
+        "correct_option_index": 2,
+        "difficulty_level": "Intermediate",
         "blooms_level": "Analyze",
+        "relevance_percentage": 95,
+        "course_name": "...",
         "answer_rationale": {
           "correct_answer_explanation": "...",
           "why_factor": "...",
@@ -475,18 +517,38 @@ multipart/form-data fields:
         "reasoning": {
           "learning_objective_alignment": "...",
           "competency_alignment": {
-            "kcm": {"competency_area": "...", "competency_theme": "...", "sub_theme": "..."},
+            "kcm": {
+              "competency_area": "...",
+              "competency_theme": "...",
+              "competency_sub_theme": "..."
+            },
             "domain": "..."
           },
           "blooms_level_justification": "...",
-          "relevance_percentage": 95
+          "difficulty_justification": "...",
+          "question_type_rationale": "...",
+          "assessment_type_relevance": "..."
         }
       }
     ],
-    "FTB Question": [...],
-    "MTF Question": [...],
-    "Multiple Select Question": [...],
-    "True/False Question": [...]
+    "FTB Question": [],
+    "MTF Question": [],
+    "Multi-Choice Question": [],
+    "True/False Question": []
   }
 }
 ```
+
+**The five `questions` keys are exact strings** — `Multiple Choice Question`, `FTB Question`, `MTF Question`, `Multi-Choice Question`, `True/False Question`. Note how close `Multiple Choice Question` (single answer) and `Multi-Choice Question` (multiple answers) are; `exporters_csv_v2.py` distinguishes them by exact match, so client code must too.
+
+Per-type differences from the MCQ shape above:
+
+| Type | `question_type` | Answer fields |
+|---|---|---|
+| `Multiple Choice Question` | `"MCQ"` | `options[]` + `correct_option_index` (integer) |
+| `Multi-Choice Question` | `"MULTICHOICE"` | `options[]` + `correct_option_index` (**array** of integers) |
+| `FTB Question` | `"FTB"` | `correct_answer` (string); blanks appear as `___` in `question_text` |
+| `MTF Question` | `"MTF"` | `matching_context` + `pairs[]` of `{left, right}` — **no `question_text`** |
+| `True/False Question` | `"TRUEFALSE"` | `correct_answer`, either `"True"` or `"False"` |
+
+Every type carries `question_id`, `question_type`, `reasoning`, `relevance_percentage` and `answer_rationale` as required fields; `difficulty_level`, `blooms_level` and `course_name` are optional. `relevance_percentage` sits at the **top level** of each question, not inside `reasoning`. Each entry in `options[]` carries its own `index`, and correctness is matched against that value — not the array position — so never assume the two agree.
