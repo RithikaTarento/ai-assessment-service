@@ -20,6 +20,10 @@
       "key": "job_id",
       "value": "",
       "description": "Job ID returned from the Generate request — paste it here to use in Status / Update / Download"
+    },
+    {
+      "key": "question_id",
+      "value": "mcq_001"
     }
   ],
   "item": [
@@ -178,7 +182,411 @@
       "response": []
     },
     {
-      "name": "Update Assessment",
+      "name": "List Questions in Order",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json"
+          },
+          {
+            "key": "cookie",
+            "value": "{{cookie}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/questions/list/{{job_id}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "questions",
+            "list",
+            "{{job_id}}"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Edit Question (dry run — pre-update alert)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json"
+          },
+          {
+            "key": "cookie",
+            "value": "{{cookie}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"request\": {\n    \"questionId\": \"{{question_id}}\",\n    \"version\": 1,\n    \"updates\": {\n      \"question_text\": \"Revised question text?\",\n      \"correct_option_index\": 2,\n      \"blooms_level\": \"Apply\",\n      \"relevance_percentage\": 88,\n      \"answer_rationale.correct_answer_explanation\": \"Option C is correct because ...\",\n      \"reasoning.learning_objective_alignment\": \"LO-3: Evaluate policy instruments\",\n      \"course_name\": \"Foundations of Public Policy\",\n      \"reasoning.competency_alignment.kcm.competency_area\": \"Behavioural\",\n      \"reasoning.competency_alignment.kcm.competency_theme\": \"Outcome Orientation\",\n      \"reasoning.competency_alignment.kcm.competency_sub_theme\": \"Accountability\"\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{base_url}}/questions/update/{{job_id}}?dry_run=true",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "questions",
+            "update",
+            "{{job_id}}"
+          ],
+          "query": [
+            {
+              "key": "dry_run",
+              "value": "true"
+            }
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Edit Question",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json"
+          },
+          {
+            "key": "cookie",
+            "value": "{{cookie}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"request\": {\n    \"questionId\": \"{{question_id}}\",\n    \"version\": 1,\n    \"updates\": {\n      \"question_text\": \"Revised question text?\",\n      \"correct_option_index\": 2,\n      \"blooms_level\": \"Apply\",\n      \"relevance_percentage\": 88,\n      \"answer_rationale.correct_answer_explanation\": \"Option C is correct because ...\",\n      \"reasoning.learning_objective_alignment\": \"LO-3: Evaluate policy instruments\",\n      \"course_name\": \"Foundations of Public Policy\",\n      \"reasoning.competency_alignment.kcm.competency_area\": \"Behavioural\",\n      \"reasoning.competency_alignment.kcm.competency_theme\": \"Outcome Orientation\",\n      \"reasoning.competency_alignment.kcm.competency_sub_theme\": \"Accountability\"\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{base_url}}/questions/update/{{job_id}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "questions",
+            "update",
+            "{{job_id}}"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Add Question",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json"
+          },
+          {
+            "key": "cookie",
+            "value": "{{cookie}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"request\": {\n    \"questionType\": \"mcq\",\n    \"position\": 1,\n    \"version\": 1,\n    \"question\": {\n      \"question_text\": \"Which body approves the Union Budget?\",\n      \"options\": [\n        {\n          \"text\": \"Parliament\",\n          \"index\": 0\n        },\n        {\n          \"text\": \"NITI Aayog\",\n          \"index\": 1\n        },\n        {\n          \"text\": \"RBI\",\n          \"index\": 2\n        },\n        {\n          \"text\": \"Cabinet Secretariat\",\n          \"index\": 3\n        }\n      ],\n      \"correct_option_index\": 0,\n      \"blooms_level\": \"Remember\",\n      \"relevance_percentage\": 85,\n      \"difficulty_level\": \"intermediate\",\n      \"course_name\": \"Foundations of Public Policy\",\n      \"answer_rationale\": {\n        \"correct_answer_explanation\": \"Parliament approves the Union Budget.\",\n        \"why_factor\": \"Constitutional mandate\",\n        \"logic_justification\": \"Article 112\"\n      },\n      \"reasoning\": {\n        \"learning_objective_alignment\": \"LO-1: Identify budget authorities\",\n        \"competency_alignment\": {\n          \"kcm\": {\n            \"competency_area\": \"Functional\",\n            \"competency_theme\": \"Public Finance\",\n            \"competency_sub_theme\": \"Budgeting\"\n          }\n        }\n      }\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{base_url}}/questions/create/{{job_id}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "questions",
+            "create",
+            "{{job_id}}"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Delete Question (dry run — confirmation content)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json"
+          },
+          {
+            "key": "cookie",
+            "value": "{{cookie}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/questions/delete/{{job_id}}?dry_run=true",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "questions",
+            "delete",
+            "{{job_id}}"
+          ],
+          "query": [
+            {
+              "key": "dry_run",
+              "value": "true"
+            }
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"request\": {\n    \"questionId\": \"{{question_id}}\"\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Delete Question (confirmed)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json"
+          },
+          {
+            "key": "cookie",
+            "value": "{{cookie}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/questions/delete/{{job_id}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "questions",
+            "delete",
+            "{{job_id}}"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"request\": {\n    \"questionId\": \"{{question_id}}\",\n    \"confirm\": true,\n    \"version\": 1\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Reorder — move one question",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json"
+          },
+          {
+            "key": "cookie",
+            "value": "{{cookie}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"request\": {\n    \"questionId\": \"{{question_id}}\",\n    \"position\": 1,\n    \"version\": 1\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{base_url}}/questions/order/{{job_id}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "questions",
+            "order",
+            "{{job_id}}"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Reorder — full sequence",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json"
+          },
+          {
+            "key": "cookie",
+            "value": "{{cookie}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"request\": {\n    \"questionOrder\": [\n      \"{{question_id}}\",\n      \"mcq_002\",\n      \"ftb_001\"\n    ],\n    \"version\": 1\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{base_url}}/questions/order/{{job_id}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "questions",
+            "order",
+            "{{job_id}}"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Get Audit Trail",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json"
+          },
+          {
+            "key": "cookie",
+            "value": "{{cookie}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/audit/{{job_id}}?limit=200&offset=0",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "audit",
+            "{{job_id}}"
+          ],
+          "query": [
+            {
+              "key": "limit",
+              "value": "200"
+            },
+            {
+              "key": "offset",
+              "value": "0"
+            }
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Report Editor Lifecycle Event (Assessment Edit Opened / Question Edit Started / Question Edit Cancelled / Assessment Reopened)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json"
+          },
+          {
+            "key": "cookie",
+            "value": "{{cookie}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"request\": {\n    \"eventCode\": \"TEL-02\",\n    \"questionId\": \"{{question_id}}\",\n    \"questionType\": \"mcq\",\n    \"questionPosition\": 1\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{base_url}}/telemetry/{{job_id}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "telemetry",
+            "{{job_id}}"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Update Whole Assessment (legacy)",
       "request": {
         "method": "PUT",
         "header": [
@@ -197,7 +605,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"assessment_data\": {}\n}",
+          "raw": "{\n  \"version\": 1,\n  \"assessment_data\": {}\n}",
           "options": {
             "raw": {
               "language": "json"

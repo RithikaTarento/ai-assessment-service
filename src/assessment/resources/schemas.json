@@ -105,7 +105,8 @@
                         "type": "string"
                       },
                       "index": {
-                        "type": "integer"
+                        "type": "integer",
+                        "description": "ZERO-BASED position of this option. The first option MUST be 0, the second 1, and so on. Never start at 1."
                       }
                     },
                     "required": [
@@ -115,7 +116,8 @@
                   }
                 },
                 "correct_option_index": {
-                  "type": "integer"
+                  "type": "integer",
+                  "description": "ZERO-BASED index of the single correct option. MUST equal the `index` of that option, so 0 selects the first option. Never one-based."
                 },
                 "difficulty_level": {
                   "type": "string"
@@ -472,7 +474,8 @@
                         "type": "string"
                       },
                       "index": {
-                        "type": "integer"
+                        "type": "integer",
+                        "description": "ZERO-BASED position of this option. The first option MUST be 0, the second 1, and so on. Never start at 1."
                       }
                     },
                     "required": [
@@ -483,6 +486,7 @@
                 },
                 "correct_option_index": {
                   "type": "array",
+                  "description": "ZERO-BASED indexes of every correct option. Each value MUST equal the `index` of a correct option, so 0 selects the first option. Never one-based.",
                   "items": {
                     "type": "integer"
                   }

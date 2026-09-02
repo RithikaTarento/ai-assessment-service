@@ -168,7 +168,7 @@ If a job with the same hash (course IDs + assessment type + difficulty + questio
 |---|---|---|---|
 | `practice` | Required | Optional | Reinforcement assessment for a single course |
 | `final` | Required | Optional | Summative/certification assessment for a single course |
-| `comprehensive` | Required (multiple) | Optional | Cross-course assessment; supports per-course weightage |
+| `comprehensive` | Required (multiple) | Optional | Cross-course assessment; question count is split across courses via `course_allocation` (explicit per-course counts, preferred) or the legacy `course_weightage` percentage fallback |
 | `standalone` | Uploaded files (PDF/VTT) | Optional | No course ID needed; content comes from uploaded files |
 | `competency` | Optional | **Required** | Pure KCM-aligned; works with or without course content |
 
@@ -211,6 +211,13 @@ ai-assessment-service/
 │       ├── api.py                   ← FastAPI app (API process)
 │       ├── worker_service.py        ← Kafka consumer (Worker process)
 │       ├── generator.py             ← LLM prompt engineering & parsing
+│       ├── allocation.py            ← Course-level question allocation (Comprehensive)
+│       ├── batching.py              ← Batch planning/merging for large assessments
+│       ├── blueprint.py             ← Assembles the assessment blueprint in Python (batched path)
+│       ├── questions.py             ← Editable question model: ids, ordering, provenance
+│       ├── validation.py            ← Validation gate + pre-update alerts
+│       ├── editing.py               ← Edit / add / delete / reorder operations + audit
+│       ├── telemetry.py             ← TEL-* event emission (pluggable sinks)
 │       ├── fetcher.py               ← Karmayogi Learning API client
 │       ├── db.py                    ← PostgreSQL async operations
 │       ├── auth.py                  ← JWT validation
@@ -271,10 +278,76 @@ The most complex file. Contains all prompt engineering logic.
 
 - Builds the full LLM prompt: system instructions + KCM context + course content + user config
 - Handles Bloom's taxonomy distribution across question types (proportional round-robin)
+- Resolves/verifies course allocation for Comprehensive assessments via `allocation.py`
+- For assessments larger than `QUESTION_BATCH_SIZE`, branches into a batched path: plans and merges parallel calls via `batching.plan_batches`/`merge_batches`, and assembles the blueprint in Python via `blueprint.build_blueprint` (imported as `blueprint_builder`) instead of asking the model for it
 - Sends the prompt to Google Gemini via `client.aio.models.generate_content`
-- Parses and validates the structured JSON response
+- Parses the structured JSON response (real field/answer/mapping validation lives in `validation.py`, applied on the editing endpoints, not here)
 - Handles Gemini context caching for the KCM descriptions (~60k tokens)
 - Returns `(metadata, assessment_data, usage_stats)`
+
+#### `allocation.py` — Course-level question allocation
+Pure functions (no I/O, no LLM, no DB) that make the Comprehensive question split deterministic: `compute_equal_allocation()` is the default equal split, `validate_allocation()` enforces that a user-supplied `course_allocation` still sums to `total_questions`, and `count_questions_by_course()` tallies what the LLM actually produced so drift is reported as a Configuration Mismatch instead of silent. Imported by `api.py` and `generator.py`.
+
+#### `batching.py` — Batch planning and merging
+Splits an assessment bigger than `QUESTION_BATCH_SIZE` into several parallel LLM calls (batched along the question-type axis, not by course) and merges the results back into one payload, preserving Bloom's-level ordering and per-course allocation across the split. Imported by `generator.py`.
+
+#### `blueprint.py` — Python-built assessment blueprint
+Assembles the assessment blueprint in Python for the batched generation path, since no single batched call sees the whole assessment and independently-written blueprints can't be merged. Imported by `generator.py` as `blueprint_builder`.
+
+#### `questions.py` — The editable question model
+The LLM returns questions grouped into type buckets with no single sequence. This module
+adds what the editing workspace needs without breaking that shape.
+
+- `normalize_assessment()` — idempotent; guarantees a unique `question_id` and a valid `provenance` on every question, fills each option's `index`, and builds/repairs the top-level `question_order` array. It backfills assessments generated before these fields existed, which is why no data migration is needed
+- `iter_questions_in_order()` / `ordered_questions()` — iterate the authoritative sequence; used by every exporter and by `GET .../questions`
+- `question_order` is the authoritative sequence; the type buckets remain the authoritative content store
+
+#### `validation.py` — The validation gate
+Nothing reaches the database until these rules pass, so a rejected save can never leave a
+half-written assessment behind.
+
+Covers the five limbs the specification names — question, answer, option, mapping and assessment-level.
+
+- `validate_question()` — field-level rules. MCQ and Multi-Choice require **exactly 4 options**; the correct answer must reference a real option `index`; text, rationale, Bloom's level and relevance are all checked
+- `validate_mapping()` — the competency triple is all-or-nothing, and mapping fields cannot be blanked. The KCM **vocabulary** check (against `resources/competencies.json`) runs only when a competency field is actually edited, because generated questions occasionally carry a label that is not an exact dataset match and a blanket check would make unrelated edits impossible on those questions
+- `validate_assessment()` — assessment-level invariants (at least one question, unique ids), plus per-question rules scoped to the questions a save actually touches, so a gap in an older question cannot block an unrelated edit
+- `EDITABLE_FIELDS` — the per-type allowlist of editable dotted paths. Server-owned fields (`question_id`, `question_type`, `provenance`) are never client-writable
+- `build_change_alerts()` / `build_delete_alerts()` — pre-update alert content, with severities
+- `classify_option_change()` — distinguishes a pure re-sequencing of the options from a real content or answer-key edit, so reordering them does not report itself as "the correct answer will change"
+
+#### `editing.py` — Editing operations
+Pure functions: current `assessment_data` in, new copy plus audit rows out. No database or
+HTTP concerns, so the rules are identical no matter which endpoint drove the change.
+
+- `apply_question_edit()`, `apply_question_add()`, `apply_question_delete()`, `apply_question_reorder()`
+- `diff_assessments()` — derives the same audit rows from a before/after comparison, backing the legacy whole-blob `PUT`
+- Enforces the provenance transitions: `ai_generated` → `ai_assisted` on first edit; manually added questions are `human_authored` and stay so however often they are edited
+
+#### `telemetry.py` — TEL-* events
+Declares the full telemetry event registry in one place; the events from Assessment Edit Opened through Assessment Reopened are emitted from the editing workspace. Of Groups D and E, Question Distribution Generated and Configuration Mismatch are also emitted, from `api.py` and `generator.py` at generation time (allocation resolution/validation), not edit time. Course Selected, Course Removed, Question Generation Requested and Generation Limit Validation still have no call sites.
+
+| Event |
+|---|
+| Assessment Edit Opened *(client-reported)* |
+| Question Edit Started *(client-reported)* |
+| Question Edit Saved |
+| Question Edit Cancelled *(client-reported)* |
+| Question Added |
+| Question Deleted |
+| Question Reordered |
+| Option Added / Option Deleted |
+| Correct Answer Changed |
+| Mapping Updated |
+| Validation Failed |
+| Save Failed / Save Successful |
+| Assessment Downloaded |
+| Assessment Reopened *(client-reported)* |
+| Question Distribution Generated *(generation-time)* |
+| Configuration Mismatch *(generation-time)* |
+
+- `AUDITED_EVENTS` — the six the specification names as audit feeds (Question Edit Saved, Question Added, Question Deleted, Question Reordered, Correct Answer Changed, Mapping Updated). Those are persisted to `interactive_assessment_audit` transactionally; the rest are logged only
+- `UI_REPORTED_EVENTS` — the four that happen entirely in the client and are reported through `POST /telemetry/{job_id}`. Any event describing a write is server-emitted and cannot be injected by a client
+- `register_sink()` is the extension point: a Kafka or analytics sink registers there and every existing call site starts feeding it with no further edits. The dashboard/reporting layer itself is not built
 
 #### `fetcher.py` — Course content retrieval
 Fetches all content for a given course from the Karmayogi platform.
@@ -348,7 +421,7 @@ Generates CSV files in the iGot platform's 7-option import schema.
 APScheduler job that runs daily and **deletes files from disk — it does not touch the database**. It scans the top level of `INTERACTIVE_COURSES_PATH` and removes any entry whose mtime is older than `CLEANUP_RETENTION_DAYS` (default: 7 days), reclaiming cached course content. Job rows in PostgreSQL are never deleted. Schedule configured via `CLEANUP_SCHEDULE_HOUR` / `CLEANUP_SCHEDULE_MINUTE` (default: 03:00).
 
 #### `config.py` — Environment variable registry
-Single source of truth for all configuration. Loads `.env` at import time. If you add a new env var anywhere, add it here first.
+Source of truth for almost all configuration. Loads `.env` at import time. If you add a new env var anywhere, add it here first. Exception: `cleanup.py` reads `CLEANUP_RETENTION_DAYS`, `CLEANUP_SCHEDULE_HOUR` and `CLEANUP_SCHEDULE_MINUTE` directly via `os.getenv()`, bypassing this module.
 
 #### `resources/prompts.yaml` — LLM prompts
 All system and user prompt templates. Versioned (`version` key). Changing prompts here changes LLM output behaviour for all new jobs — do not edit without testing against all assessment types.
@@ -383,6 +456,14 @@ Copy `.env.example` → `.env` and fill in values. **Never commit `.env`.**
 | `GOOGLE_LOCATION` | Worker | Vertex AI region (e.g. `us-central1`) |
 | `GENAI_MODEL_NAME` | Worker | Gemini model (e.g. `gemini-2.5-pro`) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Worker | Path to Vertex AI service account JSON |
+| `QUESTION_BATCH_SIZE` | Worker | Assessments larger than this go through the batched (parallel-call) generation path (default `25`) |
+| `LLM_MAX_CONCURRENCY` | Worker | Max in-flight LLM calls process-wide, to stay under Vertex quota (default `4`) |
+| `BATCH_MAX_ATTEMPTS` | Worker | Retry attempts per batch before the job fails (default `2`) |
+| `ENABLE_QUESTION_BATCHING` | Worker | `false` forces every request down the original single-call path (default `true`) |
+| `BATCH_TEMPERATURE` | Worker | Sampling temperature for batch calls (default `0.1`, same as the single-call path) |
+| `NORMALIZE_OPTION_INDEX_BASE` | Worker | `false` disables the one-based→zero-based option index rebase on ingest (default `true`) |
+| `BATCH_SIZE_BY_TYPE` | Worker | Per-question-type override of `QUESTION_BATCH_SIZE` (code dict, not an env var; default: no override for any type) |
+| `MAX_QUESTIONS_PER_TYPE` | Worker | Per-question-type question limit (code dict, not an env var; default: no limit for any type; not currently enforced) |
 | `DOCUMENT_STORAGE_TYPE` | Both | `local` (default) or `gcs` |
 | `GCS_CREDENTIALS` | Both (GCS only) | Path to GCS service account JSON |
 | `GCS_BUCKET_NAME` | Both (GCS only) | GCS bucket name |
@@ -471,9 +552,42 @@ uv run streamlit run ui/app.py
 |---|---|---|
 | `POST` | `/generate` | Start an assessment generation job |
 | `GET` | `/status/{job_id}` | Poll job status and get result |
-| `PUT` | `/update/{job_id}` | Edit a completed assessment |
 | `GET` | `/history` | All jobs by the authenticated user |
-| `GET` | `/download/{job_id}?format=<fmt>` | Download result (csv/json/pdf/docx) |
+| `GET` | `/download/{job_id}?format=<fmt>` | Download result (csv/csv_basic/json/pdf/docx) |
+| **Editing workspace** | | |
+| `GET` | `/questions/list/{job_id}` | Questions in authoritative order, position-annotated |
+| `POST` | `/questions/create/{job_id}` | Add a question manually — returns `201` on success |
+| `POST` | `/questions/update/{job_id}` | Edit one question in place — `questionId` in the body |
+| `POST` | `/questions/delete/{job_id}` | Delete a question — `questionId` + `confirm: true` in the body |
+| `POST` | `/questions/order/{job_id}` | Reorder questions — `questionOrder` array in the body |
+| `GET` | `/audit/{job_id}` | Audit trail of all human changes |
+| `POST` | `/telemetry/{job_id}` | Report an editor lifecycle event (Assessment Edit Opened, Question Edit Started, Question Edit Cancelled, or Assessment Reopened) |
+| `PUT` | `/update/{job_id}` | Replace the whole assessment (legacy; prefer the granular endpoints) |
+
+Every editing call is validated, versioned and audited. Send the assessment's `version`
+(body field or `If-Match` header) so a concurrent update fails with `409` instead of
+silently overwriting someone else's change. Add `?dry_run=true` to preview a change and
+its alerts without saving.
+
+**Path shape.** These endpoints are routed by a Kong `API` entity (Kong 0.10–0.14), which
+can only prefix-match: it strips the matched prefix and appends the remaining path
+verbatim upstream. It cannot reorder segments, and it cannot express a path parameter
+followed by further segments. So every path is a **static verb prefix followed by
+`job_id` as the single trailing segment**, and every other identifier travels in the
+request body. The verb comes *before* `job_id`, so a job id can never collide with a
+route name, and there is deliberately no bare `/questions` route — on a longest-prefix
+router it would shadow all five verb routes.
+
+`PATCH`, `PUT` and `DELETE` are therefore all `POST`: the identifiers moved into the
+body, and a `GET` or `DELETE` must not carry one (semantics are undefined and
+intermediate proxies may drop it).
+
+Request bodies use the Sunbird envelope, `{"request": { ... }}`. Field names are
+camelCase (`questionId`, `questionOrder`, `questionType`, `eventCode`); the snake_case
+equivalents are also accepted. Responses are unchanged and unwrapped.
+
+See [integration/API_INTEGRATION_GUIDE.md](integration/API_INTEGRATION_GUIDE.md) for the
+full request/response contracts.
 
 ### POST /generate
 
@@ -487,6 +601,8 @@ Key form fields:
 | `question_type_counts` | JSON | ✅ | `{"mcq": 5, "ftb": 5, "mtf": 0, "multichoice": 0, "truefalse": 0}` |
 | `course_ids` | string | ✅* | Comma-separated course IDs (\*not needed for `standalone`/`competency`) |
 | `course_names` | string | ❌ | Names matching `course_ids` order — prevents N/A in history |
+| `course_allocation` | JSON | ❌ | Comprehensive only. Maps course IDs to explicit question counts; must sum to `total_questions`. Preferred over `course_weightage`. Omit for an equal split |
+| `course_weightage` | JSON | ❌ | Comprehensive only. Maps course IDs to weightage %. **Legacy** — prefer `course_allocation` |
 | `language` | enum | ❌ | Default: `english`. Options: `hindi`, `tamil`, `telugu`, etc. |
 | `enable_blooms` | bool | ❌ | Default: `true`. Enable Bloom's distribution |
 | `blooms_config` | JSON | ❌ | `{"remember": 20, "understand": 30, ...}` — must sum to 100 |
@@ -606,7 +722,9 @@ Restart the Worker. Traces appear immediately on next generation job.
 
 ## 12. Database Schema
 
-Single table: `interactive_assessments`, created by `db.py` at startup (`CREATE TABLE IF NOT EXISTS`).
+Two tables, both created by `db.py` at startup (`CREATE TABLE IF NOT EXISTS` plus additive `ADD COLUMN IF NOT EXISTS` migrations — no manual migration step).
+
+### `interactive_assessments`
 
 | Column | Type | Description |
 |---|---|---|
@@ -619,6 +737,32 @@ Single table: `interactive_assessments`, created by `db.py` at startup (`CREATE 
 | `assessment_data` | JSONB | Full LLM output (blueprint + questions) |
 | `token_usage` | JSONB | Token counts from Gemini (prompt / candidates / thoughts / total) |
 | `error_message` | TEXT | Set on FAILED jobs |
+| `version` | INTEGER | Assessment version. `1` on generation, +1 per saved edit. Drives optimistic concurrency |
+| `ai_original_data` | JSONB | The pristine AI-generated assessment, never modified after generation — retained for audit |
+| `edited_at` | TIMESTAMP | First human edit, or NULL if never edited |
+
+### `interactive_assessment_audit`
+
+One row per human change. Written in the same transaction as the assessment update, so a
+row exists if and only if the change was actually persisted.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | BIGSERIAL PRIMARY KEY | Insertion order — also the chronological order |
+| `job_id` | TEXT | The assessment this change belongs to |
+| `assessment_version` | INTEGER | The version this change produced |
+| `event_code` | TEXT | Question Edit Saved (edited) · Question Added · Question Deleted · Question Reordered |
+| `event_name` | TEXT | Human-readable event name |
+| `editor_id` | TEXT | The user who made the change |
+| `question_id` | TEXT | Affected question |
+| `question_type` | TEXT | `mcq` / `ftb` / `mtf` / `multichoice` / `truefalse` |
+| `previous_position` | INTEGER | Position before the change |
+| `new_position` | INTEGER | Position after the change |
+| `changed_fields` | JSONB | `[{field, previous_value, new_value}]` |
+| `original_question` | JSONB | The AI-generated question, captured on its first human edit |
+| `question_snapshot` | JSONB | The question as it stands after this change |
+| `details` | JSONB | Provenance transition, answer-key-changed flag, and similar context |
+| `created_at` | TIMESTAMP | When the change was made |
 
 > **Watch the column names.** The primary key is `course_id` but it stores the full composite job ID, not a bare Karmayogi course ID — legacy naming from v1. `GET /history` aliases it back with `SELECT course_id AS job_id`, which is why the API speaks `job_id` while the table stores `course_id`. Likewise the token column is `token_usage`, not `usage`. `GET /status/{job_id}` returns the raw row, so its response carries `course_id` and `token_usage` too.
 
@@ -648,6 +792,28 @@ SELECT course_id AS job_id, user_id, created_at, error_message
 FROM interactive_assessments
 WHERE status = 'FAILED'
 ORDER BY created_at DESC;
+
+-- How many assessments have been reviewed after generation
+SELECT
+  count(*)                                       AS total,
+  count(*) FILTER (WHERE edited_at IS NOT NULL)  AS edited,
+  round(100.0 * count(*) FILTER (WHERE edited_at IS NOT NULL) / count(*), 1) AS pct_edited
+FROM interactive_assessments
+WHERE status = 'COMPLETED';
+
+-- Most frequently edited fields
+SELECT c->>'field' AS field, count(*) AS edits
+FROM interactive_assessment_audit,
+     jsonb_array_elements(changed_fields) AS c
+WHERE event_code = 'TEL-03'
+GROUP BY 1 ORDER BY edits DESC;
+
+-- Change history for one assessment
+SELECT assessment_version, event_code, editor_id, question_id,
+       previous_position, new_position, changed_fields, created_at
+FROM interactive_assessment_audit
+WHERE job_id = '<job_id>'
+ORDER BY id;
 ```
 
 ---
@@ -661,6 +827,12 @@ ORDER BY created_at DESC;
 | `csv_basic` | `format=csv_basic` | 6-option schema, **MCQ only** (single + multi answer). FTB / MTF / True-False rows are omitted. `TRUE`/`FALSE` correctness, no QuestionType or QuestionTagging columns |
 | `pdf` | `format=pdf` | Formatted PDF with Indian language font support |
 | `docx` | `format=docx` | Word document |
+
+All formats are generated from the **persisted final assessment** — edited, added and
+deleted questions and the saved `question_order` are reflected in every one, and questions
+appear in the same sequence across all of them. PDF and DOCX render a single ordered list
+with the question type as a per-question label, rather than grouping questions under
+per-type headings.
 
 ---
 
@@ -691,3 +863,56 @@ Both are configured via env vars; defaults are in `.env.example`.
 
 ### JWT leaking
 Never include the JWT token in a URL query string or `<a href>`. Use the `x-authenticated-user-token` header and the Fetch API for downloads. URLs are logged by every proxy, CDN, and browser in between.
+
+### Question order lives in `question_order`, not in the buckets
+`assessment_data.questions` is a dict of type buckets — it stores content, not sequence. The authoritative order is the top-level `assessment_data.question_order` array of question IDs. Anything that presents, exports or publishes questions must go through `iter_questions_in_order()`; iterating the buckets directly will silently ignore every reorder the reviewer made.
+
+### `normalize_assessment()` is a read-time projection
+Assessments generated before the editing workspace have no `question_id`, no `provenance` and no `question_order`. `normalize_assessment()` backfills all three deterministically (in canonical bucket order, i.e. the order the exporters used previously), and is called on every read and every write. That is why there is no data migration for `assessment_data` — but it also means **nothing may depend on a question ID staying the same across a re-generation**. IDs are stable for a given stored payload, not across regenerations.
+
+### Provenance and question IDs are server-owned
+Clients naturally echo the whole question object back, so `question_id`, `question_type` and `provenance` are ignored rather than rejected on input. Never treat a client-supplied provenance as authoritative: `editing.py` derives it, and the whole-blob `PUT` path explicitly restores it from the stored copy.
+
+### Cache cloning clones the pristine AI copy, not the edited one
+`find_job_by_prefix()` matches on `course_id LIKE <prefix>% AND status = 'COMPLETED'`, ordered by `updated_at DESC LIMIT 1` — there is no `version`/`edited_at` filter, so a reviewer-edited assessment is still eligible to match. What keeps another user's edits from leaking is which payload the caller clones, not which rows qualify: `api.py` clones `template['ai_original_data'] or template['assessment_data']` — the pristine AI copy, falling back to `assessment_data` only for legacy rows that predate the `ai_original_data` column. Excluding edited rows instead would force a fresh (paid) LLM generation whenever every existing copy of a signature had already been reviewed.
+
+### Editing changes the version, so clients must round-trip it
+Every successful editing call returns the new `version`. A client that does not carry it forward will get `409` on its next call (if it sends a stale one) or risk overwriting a concurrent change (if it sends none). The `409` path writes nothing.
+
+This is also what satisfies "duplicate save requests must be prevented": two requests carrying the same version cannot both apply, and a versionless repeat diffs to nothing. There is no separate idempotency key.
+
+### One save can write several audit rows
+An answer-key change writes Question Edit Saved **and** Correct Answer Changed; a mapping change writes Question Edit Saved **and** Mapping Updated; a reorder writes one Question Reordered per question that moved. Rows from one save share an `assessment_version`, which is how they group back into a single reviewer action. Do not assume one row per save.
+
+### The competency triple must be edited together
+Changing only `competency_theme` leaves the stored sub-theme belonging to the old theme, and validation rejects it. Clients must send area, theme and sub-theme in the same request. `resources/competencies.json` is the vocabulary — note that it has exactly two areas (Behavioural, Functional) and that plausible-sounding themes like "Integrity" are not in it.
+
+### Adding a telemetry destination
+`telemetry.register_sink(fn)` at startup and every existing emission point feeds it — no call-site changes. Sinks must not raise (exceptions are caught and logged) and must not block, since they run on the request path. This is the intended seam for the reporting layer.
+
+### Option `index` is the answer key, not array position
+`correct_option_index` is matched against each option's own `index` field. `normalize_assessment()` guarantees that field exists, filling it zero-based. Before that, the exporters disagreed on the fallback when `index` was absent — PDF/DOCX assumed zero-based, CSV assumed one-based — which could mark different options correct in different download formats for the same question.
+
+### Option indexes are zero-based, and that is now stated in three places
+The first option is `index` 0. Until prompt version 4.3 nothing said so: `resources/prompts.yaml` never mentioned `index`, and `resources/schemas.json` typed both fields as a bare `integer`. The model therefore numbered its options 0-based on some generations and 1-based on others — the same request could come back either way, and within a batched job different batches could disagree.
+
+The convention is now stated to the model in the `OPTION INDEXING` block of both prompt templates and in the `description` of `index` and `correct_option_index` in `schemas.json` (Vertex surfaces `response_schema` descriptions to the model), and re-checked in the FINAL SELF-VALIDATION list.
+
+Because a prompt is a request and not a guarantee, `questions._rebase_option_indexes()` is the backstop: a question whose options are a clean `1..n` run, with every `correct_option_index` value inside that run, is shifted down to `0..n-1` **together with its answer key**. Identity-preserving — the same option stays correct — and anything ambiguous (a gap in the run, a stray index, an answer key already out of range) is left untouched rather than guessed at. `NORMALIZE_OPTION_INDEX_BASE=false` disables it.
+
+### The rebase runs at ingest only, never on a stored assessment
+`normalize_assessment()` takes `rebase_option_indexes=False` by default. The single caller that passes `True` is worker_service.py, on fresh LLM output before the first store. The read projection, all four edit paths, `diff_assessments()` and every exporter leave stored indexes exactly as they found them, so an assessment generated before prompt version 4.3 keeps its base for life.
+
+That is deliberate, and the reason is the edit path rather than the rebase itself. `apply_question_edit()` diffs the incoming client payload against the stored question. A client that read a question before it was rebased and wrote it back after would be sending indexes on the other scale — a stale one-based `correct_option_index` would land on a different option, silently. Because an assessment's base never changes after creation, no client can ever hold a snapshot on the wrong scale, so that failure mode does not exist rather than being merely unlikely.
+
+Leaving legacy assessments one-based costs nothing: every reader matches `correct_option_index` against each option's own `index` value, so a self-consistently one-based question has always rendered correctly. A reviewer who reorders its options renumbers it to `0..n-1` through the ordinary edit path anyway, with a proper audit trail.
+
+### The missing-`index` fill is base-aware
+An option arriving with no `index` at all used to be filled with its array position. On a one-based question that duplicates an existing index and makes the question unsaveable through validation. `_fill_missing_option_indexes()` now tries the positional fill first and keeps it whenever it is collision-free, shifting up by one only when it is not. So the result is identical to the old fill everywhere the old fill produced a valid question — checked against the old implementation across all 14,406 possible four-option index/answer-key shapes, where every one of the 1,842 divergences was a question the old fill had already made invalid. It can unblock an edit that used to fail; it cannot change one that used to work. This one is on every path, not just ingest, because it is a repair rather than a convention.
+
+### Reordering options is an `options` + `correct_option_index` edit
+Options are re-sequenced within a question through the ordinary `POST /questions/update/{job_id}` edit — there is no separate endpoint, and no server-side reorder operation. The client sends the full `options` list in its new order, renumbered `0..n-1`, **together with** the remapped `correct_option_index`: the index is the answer key, so a reorder that omits it silently marks a different option correct. Send both in one request and validation catches a mismatch; send them separately and the intermediate state is rejected.
+
+A client's answer-key control must select an **option**, not an index. Offer bare index numbers next to a reorder control and the two readings of "3" — *the option currently at index 3* versus *the index the correct option should end up at* — pick different options, and the reviewer has no way to tell which one they got. The Streamlit editor labels every entry with the option's own text for exactly this reason.
+
+`build_change_alerts()` / `classify_option_change()` tell a pure re-sequencing (same option texts, new order) apart from a genuine content edit, so a reorder raises `options_reordered` + `answer_key_reindexed` rather than the high-severity "the correct answer will change". The distinction is recorded on the audit row too — `options_reordered` on Question Edit Saved, `reindexed_only` on Correct Answer Changed.

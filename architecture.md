@@ -84,6 +84,8 @@ sequenceDiagram
     end
 ```
 
+**Batching note**: the diagram shows one `Worker->>Gemini` call per job. For assessments whose requested question count exceeds `QUESTION_BATCH_SIZE` (default 25), the Worker instead fans out into several parallel Gemini calls that are merged before `status=COMPLETED` is written — see [4.7 Batched Generation](#47-batched-generation-for-large-assessments).
+
 ---
 
 ## 3. Why API and Worker are Separate Processes
@@ -111,12 +113,12 @@ In Kubernetes, API and Worker run as **separate Deployments** with separate Dock
 ### 4.1 Content Aggregation
 
 For each course ID:
-1. `fetcher.py` calls the Karmayogi Learning AI API to retrieve VTT transcript download URLs
-2. Calls the Karmayogi Search API to get course metadata (name, description, learning objectives)
+1. `fetcher.py` calls the Karmayogi Search API (`search_content`) to get the course node and its metadata (name, description, learning objectives)
+2. For each video found on that node, calls the Karmayogi Learning AI Transcoder endpoint (`TRANSCODER_STATS_URL`) to retrieve VTT transcript download URLs
 3. Downloads VTT subtitle files and any PDF handouts
 4. Stores fetched content to disk (or GCS) — cached permanently so re-fetches are skipped on future jobs
 
-**Fallback**: If a course returns 404 from the Learning API, and `course_names` was provided in the request, the caller-supplied name is injected into the metadata so history never shows `N/A`.
+**Fallback**: If a course's local content folder is missing when generation runs — typically because the Search API step failed to find or fetch that course — and `course_names` was provided in the request, the caller-supplied name is injected into the metadata so history never shows `N/A`.
 
 ### 4.2 Prompt Structure
 
@@ -162,7 +164,7 @@ The 109 KCM competency definitions (~60k tokens) are uploaded to Gemini's contex
 |---|---|---|---|
 | `practice` | Course VTT/PDF | No | Single course reinforcement |
 | `final` | Course VTT/PDF | No | Summative / certification |
-| `comprehensive` | Multiple courses | No | Supports per-course weightage |
+| `comprehensive` | Multiple courses | No | Exact per-course question allocation (`course_allocation`), validated to sum to `total_questions` and checked for drift against what the LLM actually generated; the percentage `course_weightage` is a legacy fallback, converted internally into the same integer allocation |
 | `standalone` | Uploaded PDF/VTT | No | No course ID required |
 | `competency` | Optional | Yes | Purely KCM-aligned; works with or without course content |
 
@@ -175,6 +177,28 @@ The 109 KCM competency definitions (~60k tokens) are uploaded to Gemini's contex
 | `mtf` | Match the Following | Uses `matching_context` not `question_text` |
 | `multichoice` | Multiple Selection | Multiple correct options |
 | `truefalse` | True / False | Binary |
+
+### 4.7 Batched Generation for Large Assessments
+
+When the requested per-type question counts sum to more than `QUESTION_BATCH_SIZE` (default 25, see `config.py`), `generator.py` does not make a single LLM call. `_generate_in_batches` uses `batching.py` to split the request into several batches along the question-type axis — every batch still receives the full course content and the full KCM framework — and runs them as parallel Gemini calls via `asyncio.gather`. The batches' question payloads are then combined into one assessment with `batching.merge_batches`.
+
+On this path the `blueprint` is not written by the LLM at all: no single batch sees the whole assessment, so independently-written blueprints could not be merged. Instead `blueprint.py` assembles the blueprint deterministically in Python from the request, the course metadata, and the questions the batches actually produced (e.g. `blooms_taxonomy_mapping` and `difficulty_distribution` are counted off the merged questions rather than authored by the model).
+
+For `comprehensive` assessments, the per-course allocation (Section 4.5) is likewise split across batches by `batching.apportion_allocation` so that each batch's counts sum to its own total and each course's counts sum to its global allocation, then re-verified per batch and for the assessment as a whole.
+
+### 4.8 Editing, Validation, Telemetry & Allocation Modules
+
+Beyond `generator.py`, the question-editing workspace and comprehensive-allocation features are implemented across several modules:
+
+| Module | Responsibility |
+|---|---|
+| `questions.py` | Question-level model helpers — the five canonical question-type buckets, the `question_order` sequence, and `normalize_assessment()`, which backfills `question_id`, `provenance` and option indexes on every read and write. |
+| `editing.py` | The editing operations (`apply_question_edit`, `apply_question_add`, `apply_question_delete`, `apply_question_reorder`, `diff_assessments`) as pure functions that return an updated assessment plus the audit/telemetry events the change produced. |
+| `validation.py` | The validation gate and pre-update alerts — `validate_question`/`validate_assessment` block saving an invalid question, and `build_change_alerts`/`build_delete_alerts` describe the impact of a pending edit or deletion. |
+| `telemetry.py` | The telemetry event registry — declares the full set of event codes, builds and emits events to the audit table and any registered sink, and distinguishes the audited events from the UI-reported and observability-only ones. |
+| `allocation.py` | Course-level question allocation for comprehensive assessments — `compute_equal_allocation`, `parse_allocation` and `validate_allocation` compute and validate an exact per-course integer split, replacing the old percentage `course_weightage` hint. |
+| `blueprint.py` | The deterministic blueprint builder used on the batched generation path (Section 4.7) — assembles the blueprint fields in Python from the request, course metadata and generated questions instead of asking the LLM for them. |
+| `batching.py` | Batch planning and merging for large assessments — `plan_batches` splits a request exceeding `QUESTION_BATCH_SIZE` into parallel per-question-type batches (preserving Bloom's level order and course allocation), and `merge_batches` recombines the results into one payload. |
 
 ---
 
@@ -287,9 +311,9 @@ Only the **Worker** needs these vars. The API has no LLM calls and no Langfuse i
 
 ## 7. Database Design
 
-Single table: `interactive_assessments`, created by `db.py` at startup. Uses `asyncpg` for async PostgreSQL access with connection pooling (min 5 / max 20, 30-minute idle recycle).
+Two tables, both created by `db.py` at startup, with additive `ADD COLUMN IF NOT EXISTS` migrations applied on every boot. Uses `asyncpg` for async PostgreSQL access with connection pooling (min 5 / max 20, 30-minute idle recycle).
 
-### Schema
+### Schema — `interactive_assessments`
 
 | Column | Type | Description |
 |---|---|---|
@@ -302,6 +326,77 @@ Single table: `interactive_assessments`, created by `db.py` at startup. Uses `as
 | `error_message` | `TEXT` | Set on `FAILED` jobs |
 | `created_at` | `TIMESTAMP` | Job creation time — timezone-naive, `DEFAULT NOW()` |
 | `updated_at` | `TIMESTAMP` | Last status change time — timezone-naive |
+| `version` | `INTEGER` | Assessment version — `1` on generation, +1 per saved edit. Drives optimistic concurrency |
+| `ai_original_data` | `JSONB` | The pristine AI-generated assessment, never modified after generation — retained for audit |
+| `edited_at` | `TIMESTAMP` | First human edit, or `NULL` if never edited |
+
+### Schema — `interactive_assessment_audit`
+
+One row per human change to an assessment, written inside the same transaction as the
+assessment update. An audit row therefore exists if and only if the change was persisted.
+
+A single save can produce several rows sharing one `assessment_version`: an answer-key
+change writes Question Edit Saved and Correct Answer Changed, a mapping change writes
+Question Edit Saved and Mapping Updated, and a reorder writes one Question Reordered event
+per question that moved. Option Added/Option Deleted and Validation Failed events are
+emitted as telemetry but are not audit feeds — nor are the following, which round out
+the telemetry event set with live call sites outside the audit trail:
+
+| Event | Fires when |
+|---|---|
+| Save Failed | Any editing save that did not persist — a version conflict (`409`) or a blocked validation (`400`) — emitted from `_commit`/`_emit_validation_failure` in `api.py`. |
+| Save Successful | An editing save commits, emitted from `_commit` in `api.py` right after the DB write is confirmed. |
+| Assessment Downloaded | A client calls `GET /download/{job_id}`, emitted once per export regardless of format. |
+| Question Distribution Generated | A `comprehensive` request's per-course allocation is resolved (equal split, override, or converted from `course_weightage`), emitted from the `/generate` endpoint in `api.py`. |
+| Configuration Mismatch | The resolved allocation fails validation, or the generated assessment's per-course counts drift from what was requested — emitted from both `/generate` in `api.py` and `verify_course_allocation` in `generator.py`. |
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | `BIGSERIAL` PRIMARY KEY | Insertion order, which is also the chronological order |
+| `job_id` | `TEXT` | The assessment this change belongs to |
+| `assessment_version` | `INTEGER` | The version this change produced |
+| `event_code` | `TEXT` | The six audit feeds: Question Edit Saved · Question Added · Question Deleted · Question Reordered · Correct Answer Changed · Mapping Updated |
+| `event_name` | `TEXT` | Human-readable event name |
+| `editor_id` | `TEXT` | The user who made the change |
+| `question_id` | `TEXT` | Affected question |
+| `question_type` | `TEXT` | `mcq` / `ftb` / `mtf` / `multichoice` / `truefalse` |
+| `previous_position` | `INTEGER` | Position before the change |
+| `new_position` | `INTEGER` | Position after the change |
+| `changed_fields` | `JSONB` | `[{field, previous_value, new_value}]` |
+| `original_question` | `JSONB` | The AI-generated question, captured on its first human edit |
+| `question_snapshot` | `JSONB` | The question as it stands after this change |
+| `details` | `JSONB` | Provenance transition, answer-key-changed flag, and similar context |
+| `created_at` | `TIMESTAMP` | When the change was made |
+
+Indexed on `(job_id, id)`.
+
+### Editing workspace
+
+The `questions` object the LLM returns is a dict of per-type buckets with no single
+sequence, which the editing features need. Rather than flatten it and break every existing
+consumer, `questions.py` keeps the buckets as the content store and adds a top-level
+`question_order` array of question IDs as the authoritative sequence. Every question also
+gains a unique `question_id` and a `provenance` of `ai_generated`, `ai_assisted` or
+`human_authored`.
+
+`normalize_assessment()` backfills all of this on read and on write, deterministically and
+idempotently, so assessments generated before the editing workspace need no data
+migration. Exporters iterate `iter_questions_in_order()`, which is what makes every
+download reflect the saved sequence.
+
+Writes go through `save_edited_assessment()`, a compare-and-swap on `version`:
+
+```sql
+UPDATE interactive_assessments
+SET assessment_data = $4, version = version + 1, ...
+WHERE course_id = $1 AND user_id = $2 AND version = $3 AND status = 'COMPLETED'
+RETURNING version
+```
+
+If another writer committed since the caller read the row, zero rows match, nothing is
+written, and the API returns `409` with the current version. The audit rows are inserted in
+the same transaction, so a rejected or failed save leaves neither a partial assessment nor
+an orphan audit row.
 
 > **Column naming is legacy.** The primary key is called `course_id` but holds the full composite job ID, not a Karmayogi course ID; `get_user_assessments_history()` aliases it back with `SELECT course_id AS job_id`. The token column is `token_usage`, not `usage`. `GET /status/{job_id}` returns the raw row, so both names surface in that response.
 
@@ -310,6 +405,8 @@ Single table: `interactive_assessments`, created by `db.py` at startup. Uses `as
 **Layer 1 — DB result cache**: A deterministic `job_id` is computed from a hash of all generation parameters (assessment type, difficulty, question counts, Bloom's config, prompt version, course IDs). If a `COMPLETED` job with this ID already exists for the user, it is returned immediately — no LLM call.
 
 **Layer 2 — Cross-user clone**: If a `COMPLETED` job with the same hash prefix exists for *any* user, it is cloned to the requesting user's `job_id` instantly. The generation pipeline is bypassed entirely.
+
+Only **never-edited** assessments (`version = 1 AND edited_at IS NULL`) qualify as clone templates. Cloning a reviewer-edited assessment would hand another user content carrying someone else's edits while presenting it as fresh AI output — wrong provenance, and no audit trail for the changes it contains.
 
 ### metadata JSONB structure
 
@@ -442,9 +539,45 @@ Note that `docker-compose.yml` builds **both** the `api` and `worker` services f
 |---|---|---|
 | `POST` | `/generate` | Enqueues job. Always returns 200 — `status` is `PENDING` (new), `IN_PROGRESS` (already running) or `COMPLETED` (cached/cloned, payload under `result`) |
 | `GET` | `/status/{job_id}` | Returns status + full result when COMPLETED |
-| `PUT` | `/update/{job_id}` | Owner-only edit of assessment_data |
+| `GET` | `/questions/list/{job_id}` | Questions in authoritative order, position-annotated |
+| `POST` | `/questions/create/{job_id}` | Add a human-authored question |
+| `POST` | `/questions/update/{job_id}` | Owner-only in-place edit of one question — `questionId` in body |
+| `POST` | `/questions/delete/{job_id}` | Delete a question — `questionId` + `confirm: true` in body |
+| `POST` | `/questions/order/{job_id}` | Reorder questions — `questionOrder` array in body |
+| `GET` | `/audit/{job_id}` | Audit trail of all human changes |
+| `POST` | `/telemetry/{job_id}` | Client reports an editor lifecycle event (Assessment Edit Opened, Question Edit Started, Question Edit Cancelled, or Assessment Reopened) |
+| `PUT` | `/update/{job_id}` | Owner-only whole-blob edit of assessment_data (legacy) |
 | `GET` | `/history` | All jobs by the authenticated user |
-| `GET` | `/download/{job_id}?format=` | `csv` / `csv_basic` / `json` / `pdf` / `docx` |
+| `GET` | `/download/{job_id}?format=` | `csv` / `csv_basic` / `json` / `pdf` / `docx` — all built from the persisted final assessment |
+
+All editing endpoints validate before writing, bump `version`, and record audit rows.
+
+### Path shape and the gateway constraint
+
+Every path is a static verb prefix followed by `job_id` as the single trailing segment,
+because the fronting Kong `API` entity (Kong 0.10–0.14: `uris` / `upstream_url` /
+`strip_uri`) can only prefix-match. With `strip_uri: true` Kong strips the matched
+prefix and appends the rest of the path verbatim to `upstream_url`; it cannot reorder
+segments, and it cannot express a path parameter followed by further segments. A route
+like `/assessments/{job_id}/questions/{question_id}` is therefore unroutable there.
+
+Consequences baked into the design:
+
+- The verb segment precedes `job_id`, so a job id can never be mistaken for a route name.
+- There is **no** bare `/questions` route — on a longest-prefix router it would shadow
+  `/questions/list`, `/questions/create`, `/questions/update`, `/questions/delete` and
+  `/questions/order`.
+- `PATCH`, `PUT` and `DELETE` all became `POST`, since the identifiers they used to carry
+  in the path now travel in the body, and a `GET` or `DELETE` must not carry a body.
+- Request bodies use the Sunbird envelope `{"request": {...}}` with camelCase fields;
+  snake_case is accepted as an alias. Responses are unwrapped, as elsewhere in this service.
+
+Validation of the relocated identifiers preserves the previous status codes: a missing or
+malformed `questionId` is a `400` in the service's usual `{"detail", "errors"}` shape,
+while a well-formed `questionId` naming no question stays a `404` (`question_not_found`),
+exactly as when it arrived in the path.
+`?dry_run=true` returns the validation result and impact alerts without saving. `409`
+means a concurrent update was detected and nothing was written.
 
 ### Key generate parameters
 
@@ -459,7 +592,8 @@ multipart/form-data fields:
   language               → english | hindi | tamil | telugu | kannada | malayalam | ...
   enable_blooms          → true | false
   blooms_config          → JSON: {"remember": 20, "understand": 30, "apply": 30, "analyze": 20}
-  course_weightage       → JSON: {"do_A": 60, "do_B": 40}  (comprehensive only)
+  course_allocation      → JSON: {"do_A": 15, "do_B": 10}  (comprehensive only; exact per-course question counts, must sum to total_questions — the preferred parameter)
+  course_weightage       → JSON: {"do_A": 60, "do_B": 40}  (comprehensive only; Legacy — prefer course_allocation. Percentage, converted internally into an exact allocation)
   competency_area        → string (competency type only)
   competency_themes      → comma-separated (competency type only)
   competency_sub_themes  → comma-separated (competency type only)
@@ -489,7 +623,7 @@ Defined by `resources/schemas.json` and enforced by Gemini as `response_schema`.
     "question_type_suitability": "...",
     "evaluation_passing_policy": "...",
     "time_appropriateness_validation": "Validated for 30 minutes.",
-    "prompt_version": "4.1",
+    "prompt_version": "4.3",
     "api_version": "api/v1"
   },
   "questions": {

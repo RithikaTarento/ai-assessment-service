@@ -4,6 +4,18 @@ import re
 from typing import Dict, List, Any
 from pathlib import Path
 
+from .questions import iter_questions_in_order
+
+# Internal bucket name -> the type code used in the iGot import schema.
+CSV_TYPE_BY_BUCKET = {
+    "Multiple Choice Question": "MCQ-SCA",
+    "Multi-Choice Question": "MCQ-MCA",
+    "True/False Question": "T/F",
+    "MTF Question": "MTF",
+    "FTB Question": "FTB",
+}
+
+
 def generate_csv_v2(assessment_data: Dict[str, Any], output_path: Path):
     """
     Generates a CSV export with the specific V2 schema required by the user.
@@ -17,29 +29,19 @@ def generate_csv_v2(assessment_data: Dict[str, Any], output_path: Path):
         headers.extend([f"Option{i}", f"isOption{i}Correct"])
         
     rows = []
-    questions_obj = assessment_data.get("questions", {})
-    
     q_counter = 1
-    
-    # Flatten questions from all types
-    all_questions = []
-    for q_type, q_list in questions_obj.items():
-        for q in q_list:
-            # Normalize internal Type to CSV Type
-            csv_type = "MCQ-SCA" # Default
-            if q_type == "Multiple Choice Question": csv_type = "MCQ-SCA"
-            elif q_type == "Multi-Choice Question": csv_type = "MCQ-MCA"
-            elif q_type == "True/False Question": csv_type = "T/F"
-            elif q_type == "MTF Question": csv_type = "MTF"
-            elif q_type == "FTB Question": csv_type = "FTB"
-            else: csv_type = q_type
-            
-            all_questions.append({
-                "raw": q, 
-                "type": csv_type,
-                "complexity": q.get('reasoning', {}).get('complexity_level', 'Easy') # Fallback to Easy if missing?
-            })
-            
+
+    # Flatten in the assessment's authoritative sequence, so the row order here
+    # matches the PDF, DOCX and JSON exports.
+    all_questions = [
+        {
+            "raw": q,
+            "type": CSV_TYPE_BY_BUCKET.get(bucket, bucket),
+            "complexity": q.get('reasoning', {}).get('complexity_level', 'Easy'),
+        }
+        for bucket, q in iter_questions_in_order(assessment_data)
+    ]
+
     for item in all_questions:
         q = item["raw"]
         q_type = item["type"]
@@ -91,9 +93,12 @@ def generate_csv_v2(assessment_data: Dict[str, Any], output_path: Path):
             for i, opt in enumerate(options[:7]):
                 col_idx = i + 1
                 row[f"Option{col_idx}"] = opt.get("text", "")
-                # Match using the option's own index field (LLM-assigned),
-                # falling back to 1-based position if index field is missing
-                opt_index = int(opt["index"]) if opt.get("index") is not None else col_idx
+                # Match using the option's own index field. `normalize_assessment`
+                # guarantees it is present; the fallback is zero-based to match
+                # the documented convention and the PDF/DOCX exporters — it used
+                # to be one-based here, which could mark a different option
+                # correct in CSV than in the other formats.
+                opt_index = int(opt["index"]) if opt.get("index") is not None else i
                 is_correct = "Yes" if opt_index in correct_set else "No"
                 row[f"isOption{col_idx}Correct"] = is_correct
 
@@ -168,19 +173,15 @@ def generate_csv_basic(assessment_data: Dict[str, Any], output_path: Path):
         headers.extend([f"Option{i}", f"IsOption{i}Correct"])
 
     rows = []
-    questions_obj = assessment_data.get("questions", {})
     q_counter = 1
 
-    all_questions = []
-    for q_type, q_list in questions_obj.items():
-        if q_type == "Multiple Choice Question":
-            csv_type = "MCQ-SCA"
-        elif q_type == "Multi-Choice Question":
-            csv_type = "MCQ-MCA"
-        else:
-            continue  # only MCQ types included
-        for q in q_list:
-            all_questions.append({"raw": q, "type": csv_type})
+    # Ordered by the assessment's authoritative sequence, filtered to the MCQ
+    # types this schema supports.
+    all_questions = [
+        {"raw": q, "type": CSV_TYPE_BY_BUCKET[bucket]}
+        for bucket, q in iter_questions_in_order(assessment_data)
+        if bucket in ("Multiple Choice Question", "Multi-Choice Question")
+    ]
 
     for item in all_questions:
         q = item["raw"]
@@ -205,7 +206,7 @@ def generate_csv_basic(assessment_data: Dict[str, Any], output_path: Path):
         for i, opt in enumerate(options[:6]):
             col_idx = i + 1
             row[f"Option{col_idx}"] = opt.get("text", "")
-            opt_index = int(opt["index"]) if opt.get("index") is not None else col_idx
+            opt_index = int(opt["index"]) if opt.get("index") is not None else i
             row[f"IsOption{col_idx}Correct"] = "TRUE" if opt_index in correct_set else "FALSE"
 
         rows.append(row)

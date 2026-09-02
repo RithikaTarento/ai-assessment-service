@@ -5,18 +5,34 @@ import logging
 import json
 from pathlib import Path
 from typing import List, Optional
-from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException, APIRouter
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException, APIRouter, Header, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.openapi.utils import get_openapi
 from contextlib import asynccontextmanager
 
-from .db import init_db, close_db, create_job, get_assessment_status, find_job_by_prefix, create_completed_job, update_job_result, get_user_assessments_history
+from .db import (
+    init_db, close_db, create_job, get_assessment_status, find_job_by_prefix,
+    create_completed_job, get_user_assessments_history,
+    save_edited_assessment, get_audit_trail,
+)
 from .config import INTERACTIVE_COURSES_PATH
 from .storage import get_storage_service
 from .exporters import generate_pdf, generate_docx
 from .cleanup import start_cleanup_scheduler, stop_cleanup_scheduler
 from .events import stop_kafka_producer, send_request_event
 from .exporters_csv_v2 import generate_csv_v2, generate_csv_basic
+from . import telemetry
+from .allocation import (
+    allocation_from_weightage, compute_equal_allocation, parse_allocation,
+    validate_allocation, weightage_from_allocation,
+)
+from .questions import normalize_assessment, ordered_questions, question_count
+from .validation import ValidationError, validate_assessment
+from .editing import (
+    EditResult, apply_question_add, apply_question_delete, apply_question_edit,
+    apply_question_reorder, diff_assessments, preview_question_delete,
+    preview_question_edit,
+)
 
 # Configure Logging
 log_dir = Path("logs")
@@ -76,7 +92,7 @@ async def health():
     return {"status": "healthy", "service": "assessment-generator"}
 
 from enum import Enum
-from typing import List, Optional, Dict
+from typing import Any, List, Optional, Dict
 
 class AssessmentType(str, Enum):
     PRACTICE = "practice"
@@ -140,7 +156,8 @@ async def generate_v1(
         description="JSON string of Bloom's percentage per level"
     ),
     enable_blooms: bool = Form(True, description="Enable or disable Bloom's taxonomy"),
-    course_weightage: Optional[str] = Form(None, description="JSON mapping course IDs to weightage % (Comprehensive Phase only)"),
+    course_weightage: Optional[str] = Form(None, description="JSON mapping course IDs to weightage % (Comprehensive Phase only). Legacy — prefer course_allocation."),
+    course_allocation: Optional[str] = Form(None, description="JSON mapping course IDs to question counts (Comprehensive only). Must sum to total_questions. Omit to get an equal distribution across the selected courses."),
     course_names: Optional[List[str]] = Form(None, description="Course names matching the order of course_ids. Pass as repeated fields or a single comma-separated value."),
     competency_area: Optional[str] = Form(None, description="Competency area (required for competency assessment type). e.g. 'Behavioural'"),
     competency_themes: Optional[List[str]] = Form(None, description="Competency themes (required for competency type). Pass as repeated fields or a single comma-separated value."),
@@ -212,12 +229,37 @@ async def generate_v1(
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON for blooms_config")
 
+    # --- 1b. Course allocation ---
+    # Comprehensive assessments split the configured question count across the
+    # selected courses. Resolved here rather than in the UI so that *every*
+    # caller — Streamlit, Postman, a Kong consumer — gets the same guarantee:
+    # an explicit, integer, summing allocation. Precedence is
+    #   user-supplied counts → legacy percentages → equal default.
+    resolved_allocation = None
+    allocation_source = None
+    if assessment_type == AssessmentType.COMPREHENSIVE and c_ids:
+        resolved_allocation = parse_allocation(course_allocation)
+        if resolved_allocation:
+            allocation_source = "user_override"
+        else:
+            # Legacy callers still send percentages; convert rather than
+            # ignore, so they also end up with an enforced allocation.
+            resolved_allocation = allocation_from_weightage(course_weightage, total_questions, c_ids)
+            allocation_source = "course_weightage" if resolved_allocation else None
+        if not resolved_allocation:
+            resolved_allocation = compute_equal_allocation(total_questions, c_ids)
+            allocation_source = "equal_default"
+
     # --- 2. Hashing (Same logic) ---
     import hashlib
     param_list = [
         str(assessment_type), str(difficulty), str(total_questions),
         str(q_counts), str(sorted(q_types)), str(time_limit),
-        str(topic_names), str(language), str(blooms_config), str(enable_blooms), str(course_weightage), str(additional_instructions)
+        str(topic_names), str(language), str(blooms_config), str(enable_blooms), str(course_weightage), str(additional_instructions),
+        # Part of the signature: two requests differing only in how the questions
+        # are split across courses are different assessments and must not share
+        # a cache entry.
+        str(sorted(resolved_allocation.items())) if resolved_allocation else "None",
     ]
     if files:
          param_list.extend([f.filename for f in valid_files])
@@ -240,6 +282,34 @@ async def generate_v1(
     user_job_id = f"{composite_id}_{user_id}"
 
     logger.info(f"[{user_job_id}] Generate request | user={user_id} | type={assessment_type} | courses={c_ids} | questions={total_questions} | language={language} | difficulty={difficulty} | force={force}")
+
+    # --- 2b. Enforce the allocation ---
+    # A user override is honoured, but only if it still sums to the configured
+    # question count. Validated after the job ID is known so the Configuration
+    # Mismatch event can name the assessment, and before any job is created so
+    # a bad request never persists.
+    if resolved_allocation is not None:
+        allocation_errors = validate_allocation(resolved_allocation, total_questions, c_ids)
+        if allocation_errors:
+            actual = sum(resolved_allocation.values())
+            logger.warning(f"[{user_job_id}] Invalid course allocation ({allocation_source}): {allocation_errors}")
+            telemetry.emit_configuration_mismatch(
+                job_id=user_job_id,
+                configured_count=total_questions,
+                actual_count=actual,
+                course_allocation=resolved_allocation,
+                errors=allocation_errors,
+            )
+            raise HTTPException(status_code=400, detail=" ".join(allocation_errors))
+
+        logger.info(f"[{user_job_id}] Course allocation ({allocation_source}): {resolved_allocation}")
+        telemetry.emit_distribution_generated(
+            job_id=user_job_id,
+            allocation=resolved_allocation,
+            total_questions=total_questions,
+            allocation_source=allocation_source,
+            course_weightage_percent=weightage_from_allocation(resolved_allocation, total_questions),
+        )
 
     # --- 3. Check Status (V2 Logic: Clone or Generate) ---
 
@@ -266,7 +336,12 @@ async def generate_v1(
         if template:
             logger.info(f"[{user_job_id}] Cloning from template {template['course_id']} for user {user_id}")
             t_meta = template['metadata']
-            t_data = template['assessment_data']
+            # Clone the pristine AI copy, never the template owner's edits — the
+            # recipient must receive AI-generated content with `ai_generated`
+            # provenance and no inherited audit history. `ai_original_data`
+            # is NULL only on rows generated before the column existed, where
+            # `assessment_data` is the original by definition.
+            t_data = template['ai_original_data'] or template['assessment_data']
             t_usage = template['token_usage']
             await create_completed_job(user_job_id, user_id, t_meta, t_data, t_usage)
             logger.info(f"[{user_job_id}] Clone complete")
@@ -294,6 +369,10 @@ async def generate_v1(
             "language": language,
             "time_limit": time_limit,
             "course_weightage": course_weightage,
+            # The allocation the assessment was generated
+            # against, stored with the job so it can be reviewed afterwards.
+            "course_allocation": resolved_allocation,
+            "allocation_source": allocation_source,
             "competency_area": competency_area,
             "competency_themes": parsed_competency_themes,
             "competency_sub_themes": parsed_competency_sub_themes,
@@ -331,6 +410,8 @@ async def generate_v1(
         "blooms_distribution": b_dist,
         "enable_blooms": enable_blooms,
         "course_weightage": course_weightage,
+        "course_allocation": resolved_allocation,
+        "allocation_source": allocation_source,
         "question_types": q_types,
         "time_limit": time_limit,
         "competency_area": competency_area,
@@ -366,30 +447,919 @@ async def check_status_v1(job_id: str, user_id: str = Depends(get_current_user))
     config = meta.get("config") or {}
     if "blooms_config" in config and isinstance(config["blooms_config"], dict):
         config["blooms_config"] = {k.lower(): v for k, v in config["blooms_config"].items()}
+    status["metadata"] = meta
+
+    # Normalize the stored payload before returning it so every client sees a
+    # `question_id` on each question and the authoritative `question_order`,
+    # including for assessments generated before the editing workspace existed.
+    # This is a read-time projection — nothing is written back here; the
+    # normalized form is persisted on the first edit.
+    if status.get("assessment_data"):
+        status["assessment_data"] = normalize_assessment(status["assessment_data"])
 
     return status
 
-from pydantic import BaseModel
+
+# ==========================================================================
+# Editing workspace — Groups A, B, C
+# ==========================================================================
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
 class AssessmentUpdate(BaseModel):
     assessment_data: Dict
+    version: Optional[int] = Field(
+        None,
+        description="Assessment version this edit is based on, from GET /status. "
+                    "When supplied, the save is rejected with 409 if another "
+                    "writer has changed the assessment since.",
+    )
+
+
+# ==========================================================================
+# Sunbird request envelope
+#
+# The editing endpoints are routed by a Kong 0.10–0.14 `API` entity, which can
+# only prefix-match: it strips the matched prefix and appends the rest of the
+# path verbatim upstream. It cannot reorder segments, and it cannot express a
+# path parameter with further segments after it. So the routable shape is a
+# static verb prefix followed by `job_id` as the single trailing segment, and
+# every other identifier travels in the body instead:
+#
+#     POST /questions/update/{job_id}   body: {"request": {"questionId": ...}}
+#
+# Bodies are wrapped in the Sunbird envelope, `{"request": {...}}`. Responses
+# are left bare, matching every other handler in this service.
+# ==========================================================================
+
+
+class _EnvelopeBody(BaseModel):
+    """
+    Base for the inner object of a `{"request": {...}}` body.
+
+    `populate_by_name` lets each field be sent either as the camelCase name the
+    gateway contract documents (`questionId`) or as the snake_case name this
+    service uses internally (`question_id`).
+    """
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class QuestionEditBody(_EnvelopeBody):
+    question_id: Optional[Any] = Field(
+        None, alias="questionId",
+        description="Identifier of the question to edit. Required — it was a "
+                    "path parameter before the gateway reshape.",
+    )
+    updates: Dict[str, object] = Field(
+        ...,
+        description="Field updates keyed by dotted path, e.g. "
+                    '{"question_text": "...", "correct_option_index": 2, '
+                    '"reasoning.competency_alignment.kcm.competency_theme": "Integrity"}',
+    )
+    version: Optional[int] = Field(None, description="Version this edit is based on.")
+
+
+class QuestionEditRequest(BaseModel):
+    request: Optional[QuestionEditBody] = Field(
+        None, description="Sunbird request envelope."
+    )
+
+
+class QuestionAddBody(_EnvelopeBody):
+    question_type: str = Field(
+        ..., alias="questionType",
+        description="mcq | ftb | mtf | multichoice | truefalse",
+    )
+    question: Dict[str, object] = Field(
+        ..., description="The authored question — text, options, correct answer, "
+                         "rationale and mapping. The identifier and the "
+                         "human-authored provenance are assigned by the server."
+    )
+    position: Optional[int] = Field(
+        None, description="1-based position in the assessment sequence. "
+                         "Omit to append at the end."
+    )
+    version: Optional[int] = None
+
+
+class QuestionAddRequest(BaseModel):
+    request: Optional[QuestionAddBody] = Field(
+        None, description="Sunbird request envelope."
+    )
+
+
+class QuestionDeleteBody(_EnvelopeBody):
+    question_id: Optional[Any] = Field(
+        None, alias="questionId",
+        description="Identifier of the question to delete. Required — it was a "
+                    "path parameter before the gateway reshape.",
+    )
+    confirm: Optional[Any] = Field(
+        None,
+        description="Must be `true`. Deletion requires explicit confirmation. "
+                    "Was a query parameter before the reshape.",
+    )
+    version: Optional[int] = Field(
+        None, description="Version this delete is based on."
+    )
+
+
+class QuestionDeleteRequest(BaseModel):
+    request: Optional[QuestionDeleteBody] = Field(
+        None, description="Sunbird request envelope."
+    )
+
+
+class QuestionReorderBody(_EnvelopeBody):
+    question_order: Optional[List[str]] = Field(
+        None, alias="questionOrder",
+        description="The complete new sequence. Must list every question "
+                    "in the assessment exactly once.",
+    )
+    question_id: Optional[str] = Field(
+        None, alias="questionId",
+        description="Single-question move — used with `position`. This is "
+                    "the form a keyboard reorder produces.",
+    )
+    position: Optional[int] = Field(None, description="1-based target position.")
+    version: Optional[int] = None
+
+
+class QuestionReorderRequest(BaseModel):
+    request: Optional[QuestionReorderBody] = Field(
+        None, description="Sunbird request envelope."
+    )
+
+
+def _missing_request_response() -> JSONResponse:
+    """
+    A body that is not the Sunbird envelope. 400 in the same shape as every
+    other validation failure here, rather than Pydantic's 422.
+    """
+    return _validation_response([{
+        "code": "request_required",
+        "field": "request",
+        "message": 'Request body must be the Sunbird envelope: {"request": {...}}.',
+    }])
+
+
+def _question_id_errors(value: object) -> List[Dict]:
+    """
+    Validate the `questionId` body field — missing, non-string or blank.
+
+    Deliberately does NOT check that the id names a real question. A
+    well-formed id that matches nothing stays a 404 raised by the editing
+    layer's `question_not_found`, exactly as it was when the id arrived in the
+    path. Only malformed input is a 400.
+    """
+    if value is None:
+        return [{"code": "question_id_required", "field": "questionId",
+                 "message": "questionId is required in the request body."}]
+    if not isinstance(value, str):
+        return [{"code": "question_id_invalid", "field": "questionId",
+                 "message": "questionId must be a string."}]
+    if not value.strip():
+        return [{"code": "question_id_invalid", "field": "questionId",
+                 "message": "questionId must not be blank."}]
+    return []
+
+
+def _validation_response(errors: List[Dict], status_code: int = 400) -> JSONResponse:
+    """
+    A blocked save. `detail` stays a plain string so existing error
+    handling keeps working; `errors` carries the per-field detail.
+    """
+    first = errors[0]["message"] if errors else "Validation failed"
+    detail = first if len(errors) == 1 else f"{first} ({len(errors)} validation errors)"
+    return JSONResponse(status_code=status_code, content={"detail": detail, "errors": errors})
+
+
+def _conflict_response(job_id: str, current_version: Optional[int]) -> JSONResponse:
+    """Concurrent update detected. The save is blocked, not merged."""
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": "This assessment was changed by another update since you loaded it. "
+                      "Reload the assessment and re-apply your change.",
+            "job_id": job_id,
+            "current_version": current_version,
+        },
+    )
+
+
+def _owns(row: Dict, user_id: str) -> bool:
+    """
+    Ownership test that also resolves rows predating the `user_id` column.
+
+    `user_id` is nullable for v1 compatibility, so the earliest assessments have
+    no owner recorded. Their owner is still recoverable without touching stored
+    data: `course_id` has always been built as f"{composite_id}_{user_id}" (see
+    `generate_assessment`), so a legacy row belongs to whoever's id it ends with.
+
+    This grants no access that did not already exist — a caller can only match a
+    row whose id ends with their own authenticated user id, which is precisely
+    the row they created. A suffix test is used rather than parsing the id
+    because the middle segment varies (`comprehensive_<ids>_<hash>`,
+    `<course_id>_<hash>`, `custom_upload_<hash>`) and user ids themselves contain
+    underscores.
+    """
+    recorded = row.get("user_id")
+    if recorded:
+        return recorded == user_id
+    return str(row.get("course_id") or "").endswith(f"_{user_id}")
+
+
+async def _load_for_edit(job_id: str, user_id: str) -> Dict:
+    """
+    Fetch a completed, user-owned assessment ready for editing.
+    Raises HTTPException for the non-editable cases.
+    """
+    row = await get_assessment_status(job_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    if not _owns(row, user_id):
+        logger.warning(f"[{job_id}] Edit denied — requester={user_id} | owner={row.get('user_id')}")
+        raise HTTPException(
+            status_code=403, detail="Access denied: you do not own this assessment"
+        )
+    if row.get("status") != "COMPLETED":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Assessment is {row.get('status')} and cannot be edited until "
+                   f"generation completes.",
+        )
+    return row
+
+
+def _blooms_enabled(row: Dict) -> bool:
+    meta = row.get("metadata") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    config = meta.get("config") or {}
+    return bool(config.get("enable_blooms", True))
+
+
+def _expected_version(row: Dict, body_version: Optional[int],
+                      if_match: Optional[str]) -> int:
+    """
+    Resolve the version this write compares against.
+
+    A client-supplied version (body field or `If-Match` header) is honoured, so
+    a stale client is rejected even if it re-read the row a moment ago. Without
+    one, the version just read is used, which still closes the read-modify-write
+    window inside this request.
+    """
+    stored = int(row.get("version") or 1)
+    claimed = body_version
+    if claimed is None and if_match:
+        try:
+            claimed = int(if_match.strip().strip('"'))
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="If-Match must be the integer assessment version, e.g. 'If-Match: 3'.",
+            )
+    if claimed is not None and int(claimed) != stored:
+        raise _Conflict(stored)
+    return stored
+
+
+class _Conflict(Exception):
+    def __init__(self, current_version: int):
+        self.current_version = current_version
+
+
+async def _commit(
+    job_id: str,
+    user_id: str,
+    expected_version: int,
+    result,
+    *,
+    operation: str,
+    question_id: Optional[str] = None,
+) -> int:
+    """
+    Persist an editing result and its audit trail, then emit
+    telemetry (Save Failed / Save Successful plus the per-change events).
+
+    Success is only reported after the database confirms the write, which is
+    what lets the client show "Saved successfully" truthfully.
+
+    This is also what prevents duplicate saves. A double submission is
+    two requests carrying the same expected version: the first commits and moves
+    the version on, the second matches zero rows and returns 409 having written
+    nothing. Even with no version supplied, the second request diffs to no
+    changes and is a no-op. Neither path can apply the same edit twice.
+    """
+    audit_rows = result.audit_rows
+    new_version = await save_edited_assessment(
+        job_id, user_id, expected_version, result.assessment_data, audit_rows
+    )
+
+    if new_version is None:
+        current = await get_assessment_status(job_id)
+        current_version = int((current or {}).get("version") or 0)
+        logger.warning(
+            f"[{job_id}] {operation} rejected — version conflict | "
+            f"expected={expected_version} | current={current_version} | user={user_id}"
+        )
+        telemetry.emit(telemetry.build_event(
+            telemetry.TEL_SAVE_FAILED, job_id=job_id, editor_id=user_id,
+            assessment_version=expected_version, operation=operation,
+            question_id=question_id, reason="version_conflict", api_status=409,
+        ))
+        raise _Conflict(current_version)
+
+    logger.info(
+        f"[{job_id}] {operation} saved | version={new_version} | "
+        f"events={len(result.events)} | audit_rows={len(audit_rows)} | user={user_id}"
+    )
+    # Emit every event the operation produced. The audit table holds only the
+    # six audit feeds; telemetry sees them all, Option Added / Option Deleted included.
+    telemetry.emit_change_events(
+        result.events, job_id=job_id, editor_id=user_id,
+        assessment_version=new_version,
+    )
+    telemetry.emit(telemetry.build_event(
+        telemetry.TEL_SAVE_SUCCESSFUL, job_id=job_id, editor_id=user_id,
+        assessment_version=new_version, operation=operation,
+        question_id=question_id,
+        question_count=question_count(result.assessment_data),
+    ))
+    return new_version
+
+
+def _emit_validation_failure(job_id: str, user_id: str, row: Dict,
+                             operation: str, errors: List[Dict],
+                             question_id: Optional[str] = None) -> None:
+    """
+    Validation Failed — a blocked save is observable, which is
+    what the validation-failure-rate metric is built on.
+
+    Also emits Save Failed, so every attempted save that did not
+    persist — whether blocked by validation or lost to a version conflict —
+    lands in the same save-failure-rate bucket. Validation Failed keeps firing
+    alongside it so the validation-specific breakdown is not lost.
+    """
+    resolved_question_id = question_id or (errors[0].get("question_id") if errors else None)
+    assessment_version = int(row.get("version") or 1)
+    telemetry.emit(telemetry.build_event(
+        telemetry.TEL_VALIDATION_FAILED, job_id=job_id, editor_id=user_id,
+        assessment_version=assessment_version, operation=operation,
+        question_id=resolved_question_id,
+        validation_errors=[{"code": e.get("code"), "field": e.get("field")}
+                           for e in errors],
+    ))
+    telemetry.emit(telemetry.build_event(
+        telemetry.TEL_SAVE_FAILED, job_id=job_id, editor_id=user_id,
+        assessment_version=assessment_version, operation=operation,
+        question_id=resolved_question_id, reason="validation_failed", api_status=400,
+    ))
+
+
+def _saved_payload(job_id: str, version: int, data: Dict, result) -> Dict:
+    return {
+        "message": "Saved successfully",
+        "status": "COMPLETED",
+        "job_id": job_id,
+        "version": version,
+        "question_order": data.get("question_order", []),
+        "total_questions": question_count(data),
+        "alerts": result.alerts,
+        "announcement": result.announcement,
+    }
+
+
+@api_v1_router.get(
+    "/questions/list/{job_id}",
+    summary="List questions in assessment order",
+)
+async def list_questions_v1(job_id: str, user_id: str = Depends(get_current_user)):
+    """
+    The authoritative question sequence, flattened and position-annotated —
+    what the editing workspace renders.
+
+    Each item carries `position` (1-based), `question_bucket`,
+    `question_type_key` and `provenance` alongside the question's own fields.
+    """
+    row = await _load_for_edit(job_id, user_id)
+    data = normalize_assessment(row.get("assessment_data"))
+    return {
+        "job_id": job_id,
+        "version": int(row.get("version") or 1),
+        "total_questions": question_count(data),
+        "question_order": data.get("question_order", []),
+        "questions": ordered_questions(data),
+    }
+
+
+@api_v1_router.post(
+    "/questions/update/{job_id}",
+    summary="Edit a question in place",
+)
+async def edit_question_v1(
+    job_id: str,
+    payload: QuestionEditRequest,
+    user_id: str = Depends(get_current_user),
+    dry_run: bool = Query(
+        False,
+        description="Validate the edit and return the pre-update alerts without "
+                    "saving anything.",
+    ),
+    if_match: Optional[str] = Header(None, alias="If-Match"),
+):
+    """
+    Apply field-level updates to one question. Editable paths cover question
+    text, options, correct answer, rationale, Bloom's level, relevance,
+    learning outcome, competency and course mapping.
+
+    `questionId` names the question and travels in the body — the gateway
+    cannot route a path parameter followed by further segments.
+
+    An edited AI-generated question is recorded as **AI-assisted**; a
+    human-authored question stays human-authored.
+    """
+    if payload.request is None:
+        return _missing_request_response()
+    body = payload.request
+
+    id_errors = _question_id_errors(body.question_id)
+    if id_errors:
+        return _validation_response(id_errors)
+    question_id: str = body.question_id
+
+    row = await _load_for_edit(job_id, user_id)
+    data = row.get("assessment_data") or {}
+    enable_blooms = _blooms_enabled(row)
+
+    if dry_run:
+        preview = preview_question_edit(
+            data, question_id, body.updates,
+            editor_id=user_id, enable_blooms=enable_blooms,
+        )
+        preview["job_id"] = job_id
+        preview["version"] = int(row.get("version") or 1)
+        preview["dry_run"] = True
+        return preview
+
+    try:
+        expected = _expected_version(row, body.version, if_match)
+    except _Conflict as conflict:
+        return _conflict_response(job_id, conflict.current_version)
+
+    try:
+        result = apply_question_edit(
+            data, question_id, body.updates,
+            editor_id=user_id,
+            enable_blooms=enable_blooms,
+            ai_original_data=row.get("ai_original_data"),
+        )
+    except ValidationError as exc:
+        if any(e["code"] == "question_not_found" for e in exc.errors):
+            return _validation_response(exc.errors, status_code=404)
+        _emit_validation_failure(job_id, user_id, row, "edit_question", exc.errors,
+                                 question_id=question_id)
+        logger.info(f"[{job_id}] Edit blocked by validation | question={question_id} | "
+                    f"errors={[e['code'] for e in exc.errors]}")
+        return _validation_response(exc.errors)
+
+    if not result.changed:
+        return {
+            "message": "No changes to save",
+            "status": "COMPLETED",
+            "job_id": job_id,
+            "version": int(row.get("version") or 1),
+            "question": result.question,
+            "alerts": [],
+        }
+
+    try:
+        version = await _commit(job_id, user_id, expected, result,
+                                operation="edit_question", question_id=question_id)
+    except _Conflict as conflict:
+        return _conflict_response(job_id, conflict.current_version)
+
+    response = _saved_payload(job_id, version, result.assessment_data, result)
+    response["question"] = result.question
+    return response
+
+
+@api_v1_router.post(
+    "/questions/create/{job_id}",
+    summary="Add a question manually",
+)
+async def add_question_v1(
+    job_id: str,
+    payload: QuestionAddRequest,
+    user_id: str = Depends(get_current_user),
+    dry_run: bool = Query(False, description="Validate without saving."),
+    if_match: Optional[str] = Header(None, alias="If-Match"),
+):
+    """
+    Author a new question. The server assigns a unique identifier and marks the
+    question **human-authored** — neither can be set by the
+    caller. No AI generation is involved.
+    """
+    if payload.request is None:
+        return _missing_request_response()
+    body = payload.request
+
+    row = await _load_for_edit(job_id, user_id)
+    data = row.get("assessment_data") or {}
+    enable_blooms = _blooms_enabled(row)
+
+    try:
+        expected = _expected_version(row, body.version, if_match)
+    except _Conflict as conflict:
+        return _conflict_response(job_id, conflict.current_version)
+
+    try:
+        result = apply_question_add(
+            data, body.question_type, body.question,
+            editor_id=user_id, position=body.position, enable_blooms=enable_blooms,
+        )
+    except ValidationError as exc:
+        _emit_validation_failure(job_id, user_id, row, "add_question", exc.errors)
+        logger.info(f"[{job_id}] Add blocked by validation | "
+                    f"errors={[e['code'] for e in exc.errors]}")
+        return _validation_response(exc.errors)
+
+    if dry_run:
+        return {
+            "valid": True, "errors": [], "dry_run": True, "job_id": job_id,
+            "version": int(row.get("version") or 1),
+            "alerts": result.alerts, "question": result.question,
+        }
+
+    try:
+        version = await _commit(
+            job_id, user_id, expected, result, operation="add_question",
+            question_id=(result.question or {}).get("question_id"))
+    except _Conflict as conflict:
+        return _conflict_response(job_id, conflict.current_version)
+
+    response = _saved_payload(job_id, version, result.assessment_data, result)
+    response["question"] = result.question
+    response["question_id"] = (result.question or {}).get("question_id")
+    return JSONResponse(status_code=201, content=response)
+
+
+@api_v1_router.post(
+    "/questions/delete/{job_id}",
+    summary="Delete a question, with confirmation",
+)
+async def delete_question_v1(
+    job_id: str,
+    payload: QuestionDeleteRequest,
+    user_id: str = Depends(get_current_user),
+    dry_run: bool = Query(
+        False,
+        description="Return the confirmation content for this deletion without "
+                    "applying it.",
+    ),
+    if_match: Optional[str] = Header(None, alias="If-Match"),
+):
+    """
+    Remove a question. Requires `confirm: true` in the body, and the last
+    remaining question cannot be deleted.
+
+    This is a POST rather than a DELETE because `questionId` and the
+    confirmation flag now travel in the body, and a DELETE must not carry
+    one — intermediate proxies are free to drop it.
+    """
+    if payload.request is None:
+        return _missing_request_response()
+    body = payload.request
+
+    id_errors = _question_id_errors(body.question_id)
+    if id_errors:
+        return _validation_response(id_errors)
+    question_id: str = body.question_id
+
+    if body.confirm is not None and not isinstance(body.confirm, bool):
+        return _validation_response([{
+            "code": "confirm_invalid", "field": "confirm",
+            "message": "confirm must be a boolean.",
+        }])
+    confirm = bool(body.confirm)
+    version = body.version
+
+    row = await _load_for_edit(job_id, user_id)
+    data = row.get("assessment_data") or {}
+
+    if dry_run:
+        preview = preview_question_delete(data, question_id)
+        preview["job_id"] = job_id
+        preview["version"] = int(row.get("version") or 1)
+        preview["dry_run"] = True
+        return preview
+
+    try:
+        expected = _expected_version(row, version, if_match)
+    except _Conflict as conflict:
+        return _conflict_response(job_id, conflict.current_version)
+
+    try:
+        result = apply_question_delete(
+            data, question_id, editor_id=user_id, confirmed=confirm
+        )
+    except ValidationError as exc:
+        codes = {e["code"] for e in exc.errors}
+        if "question_not_found" in codes:
+            return _validation_response(exc.errors, status_code=404)
+        _emit_validation_failure(job_id, user_id, row, "delete_question", exc.errors,
+                                 question_id=question_id)
+        logger.info(f"[{job_id}] Delete blocked | question={question_id} | codes={codes}")
+        return _validation_response(exc.errors)
+
+    try:
+        new_version = await _commit(job_id, user_id, expected, result,
+                                    operation="delete_question",
+                                    question_id=question_id)
+    except _Conflict as conflict:
+        return _conflict_response(job_id, conflict.current_version)
+
+    response = _saved_payload(job_id, new_version, result.assessment_data, result)
+    response["deleted_question_id"] = question_id
+    return response
+
+
+@api_v1_router.post(
+    "/questions/order/{job_id}",
+    summary="Reorder questions",
+)
+async def reorder_questions_v1(
+    job_id: str,
+    payload: QuestionReorderRequest,
+    user_id: str = Depends(get_current_user),
+    if_match: Optional[str] = Header(None, alias="If-Match"),
+):
+    """
+    Re-sequence the assessment, either by sending the complete new
+    `questionOrder`, or by moving one question with `questionId` + `position`
+    — the form a keyboard reorder produces.
+
+    `announcement` in the response is ready to place in an ARIA live region so
+    screen-reader users hear the result of the move.
+    """
+    if payload.request is None:
+        return _missing_request_response()
+    body = payload.request
+
+    row = await _load_for_edit(job_id, user_id)
+    data = row.get("assessment_data") or {}
+
+    try:
+        expected = _expected_version(row, body.version, if_match)
+    except _Conflict as conflict:
+        return _conflict_response(job_id, conflict.current_version)
+
+    try:
+        result = apply_question_reorder(
+            data, editor_id=user_id,
+            question_order=body.question_order,
+            question_id=body.question_id,
+            position=body.position,
+        )
+    except ValidationError as exc:
+        _emit_validation_failure(job_id, user_id, row, "reorder_questions", exc.errors)
+        logger.info(f"[{job_id}] Reorder blocked | "
+                    f"errors={[e['code'] for e in exc.errors]}")
+        return _validation_response(exc.errors)
+
+    if not result.changed:
+        return {
+            "message": "Question order unchanged",
+            "status": "COMPLETED",
+            "job_id": job_id,
+            "version": int(row.get("version") or 1),
+            "question_order": result.assessment_data.get("question_order", []),
+            "announcement": result.announcement,
+            "alerts": [],
+        }
+
+    try:
+        version = await _commit(job_id, user_id, expected, result,
+                                operation="reorder_questions")
+    except _Conflict as conflict:
+        return _conflict_response(job_id, conflict.current_version)
+
+    return _saved_payload(job_id, version, result.assessment_data, result)
+
+
+class TelemetryEventBody(_EnvelopeBody):
+    event_code: str = Field(
+        ..., alias="eventCode",
+        description="Assessment Edit Opened · Question Edit Started · "
+                    "Question Edit Cancelled · Assessment Reopened",
+    )
+    question_id: Optional[str] = Field(
+        None, alias="questionId", description="Required for Question Edit Started and Question Edit Cancelled."
+    )
+    question_type: Optional[str] = Field(None, alias="questionType")
+    question_position: Optional[int] = Field(None, alias="questionPosition")
+    entry_point: Optional[str] = Field(
+        None, alias="entryPoint",
+        description="Assessment Edit Opened — where the user entered the editor from.",
+    )
+    source: Optional[str] = Field(
+        None, description="Assessment Reopened — e.g. 'Past Assessment'."
+    )
+
+
+class TelemetryEventRequest(BaseModel):
+    request: Optional[TelemetryEventBody] = Field(
+        None, description="Sunbird request envelope."
+    )
+
+
+@api_v1_router.post(
+    "/telemetry/{job_id}",
+    summary="Report an editor lifecycle event (Assessment Edit Opened, Question Edit Started, Question Edit Cancelled, Assessment Reopened)",
+)
+async def report_telemetry_v1(
+    job_id: str,
+    payload: TelemetryEventRequest,
+    user_id: str = Depends(get_current_user),
+):
+    """
+    Report an event the backend cannot observe for itself.
+
+    Opening the editing workspace, opening a question for editing, cancelling an
+    edit and reopening a Past Assessment all happen entirely in the client — no
+    write reaches the server, so no endpoint sees them. Reporting them is
+    required, and metrics ("% Past Assessments reopened and edited", "average
+    time from generation to final save") are built on them, so the client reports
+    them here.
+
+    Only the four editor-lifecycle codes are accepted. Every event that describes
+    a write is emitted by the server itself and cannot be injected by a client.
+
+    Cancelling an edit needs no other call: discarding the client's local state
+    is what makes the change not persist, and this reports Question Edit Cancelled.
+    """
+    if payload.request is None:
+        return _missing_request_response()
+    body = payload.request
+
+    row = await get_assessment_status(job_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    if not _owns(row, user_id):
+        raise HTTPException(
+            status_code=403, detail="Access denied: you do not own this assessment"
+        )
+
+    code = body.event_code.strip().upper()
+    event = telemetry.emit_ui_event(
+        code,
+        job_id=job_id,
+        editor_id=user_id,
+        assessment_version=int(row.get("version") or 1),
+        question_id=body.question_id,
+        question_type=body.question_type,
+        question_position=body.question_position,
+        entry_point=body.entry_point,
+        source=body.source,
+        assessment_type=((row.get("metadata") or {}).get("config") or {}).get(
+            "assessment_type"
+        ) if isinstance(row.get("metadata"), dict) else None,
+    )
+
+    if event is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{body.event_code}' is not a client-reportable event. "
+                   f"Accepted: {', '.join(sorted(telemetry.UI_REPORTED_EVENTS))}. "
+                   f"Events describing a write are emitted by the server.",
+        )
+
+    return {"recorded": True, "event_code": code,
+            "event_name": event["event_name"], "job_id": job_id}
+
+
+@api_v1_router.get(
+    "/audit/{job_id}",
+    summary="Audit trail of human changes",
+)
+async def get_audit_trail_v1(
+    job_id: str,
+    user_id: str = Depends(get_current_user),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    """
+    Every human change made to this assessment, oldest first — editor,
+    timestamp, changed fields with previous and new values, added and deleted
+    questions, sequence changes, and the assessment version each change
+    produced.
+
+    `ai_original` is the pristine AI-generated assessment, retained for audit.
+    """
+    row = await get_assessment_status(job_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    if not _owns(row, user_id):
+        raise HTTPException(
+            status_code=403, detail="Access denied: you do not own this assessment"
+        )
+
+    entries = await get_audit_trail(job_id, limit=limit, offset=offset)
+    for entry in entries:
+        created = entry.get("created_at")
+        entry["created_at"] = created.isoformat() if created else None
+
+    return {
+        "job_id": job_id,
+        "version": int(row.get("version") or 1),
+        "edited_at": row["edited_at"].isoformat() if row.get("edited_at") else None,
+        "count": len(entries),
+        "audit_trail": entries,
+        "ai_original": normalize_assessment(row.get("ai_original_data"))
+                       if row.get("ai_original_data") else None,
+    }
+
 
 @api_v1_router.put("/update/{job_id}")
 async def update_assessment_v1(
-    job_id: str, 
-    payload: AssessmentUpdate, 
-    user_id: str = Depends(get_current_user)
+    job_id: str,
+    payload: AssessmentUpdate,
+    user_id: str = Depends(get_current_user),
+    if_match: Optional[str] = Header(None, alias="If-Match"),
 ):
     """
-    Updates the assessment result.
-    Enforces that the user owns the assessment.
+    Replace the whole assessment payload.
+
+    Retained for backward compatibility, and now subject to the same rules as
+    the granular endpoints: the payload is validated, the change is
+    versioned and the difference against the stored copy is recorded in
+    the audit trail.
+
+    Prefer the granular endpoints — `POST /questions/update/{job_id}`,
+    `POST /questions/create/{job_id}`, `POST /questions/delete/{job_id}` and
+    `POST /questions/order/{job_id}` — which record the reviewer's actual intent
+    instead of inferring it from a diff.
     """
-    logger.info(f"[{job_id}] Update request | user={user_id}")
-    success = await update_job_result(job_id, user_id, payload.assessment_data)
-    if not success:
-        logger.warning(f"[{job_id}] Update failed — not found or access denied | user={user_id}")
-        raise HTTPException(status_code=404, detail="Assessment not found or you do not have permission to edit it")
-    logger.info(f"[{job_id}] Update successful | user={user_id}")
-    return {"message": "Assessment updated successfully", "status": "COMPLETED", "job_id": job_id}
+    logger.info(f"[{job_id}] Whole-blob update request | user={user_id}")
+    row = await _load_for_edit(job_id, user_id)
+
+    try:
+        expected = _expected_version(row, payload.version, if_match)
+    except _Conflict as conflict:
+        return _conflict_response(job_id, conflict.current_version)
+
+    normalized, events = diff_assessments(
+        row.get("assessment_data") or {}, payload.assessment_data, editor_id=user_id
+    )
+
+    # Validate the questions this save adds or changes. Untouched questions are
+    # left alone so a pre-existing gap elsewhere in an older assessment cannot
+    # block an unrelated edit — see `validate_assessment`.
+    touched = {
+        e["question_id"] for e in events
+        if e.get("question_id")
+        and e["event_code"] in (telemetry.TEL_QUESTION_EDIT_SAVED,
+                                telemetry.TEL_QUESTION_ADDED)
+    }
+    # Which paths each question changed, so mapping vocabulary validation only
+    # runs where the reviewer actually touched the mapping.
+    edited_paths_by_question: Dict[str, set] = {}
+    for e in events:
+        if e.get("question_id") and e.get("changed_fields"):
+            edited_paths_by_question.setdefault(e["question_id"], set()).update(
+                c["field"] for c in e["changed_fields"]
+            )
+    errors = validate_assessment(
+        normalized, enable_blooms=_blooms_enabled(row), only_question_ids=touched,
+        edited_paths_by_question=edited_paths_by_question,
+    )
+    if errors:
+        _emit_validation_failure(job_id, user_id, row, "bulk_update", errors)
+        logger.info(f"[{job_id}] Whole-blob update blocked by validation | "
+                    f"errors={[e['code'] for e in errors][:10]}")
+        return _validation_response(errors)
+
+    result = EditResult(assessment_data=normalized, events=events)
+
+    try:
+        version = await _commit(job_id, user_id, expected, result,
+                                operation="bulk_update")
+    except _Conflict as conflict:
+        return _conflict_response(job_id, conflict.current_version)
+
+    return {
+        "message": "Assessment updated successfully",
+        "status": "COMPLETED",
+        "job_id": job_id,
+        "version": version,
+        "question_order": normalized.get("question_order", []),
+        "total_questions": question_count(normalized),
+        "changes_recorded": len(result.audit_rows),
+    }
 
 SUPPORTED_FORMATS = {"csv", "csv_basic", "json", "pdf", "docx"}
 
@@ -431,10 +1401,23 @@ async def download_assessment_v1(
         logger.warning(f"[{job_id}] Download rejected — access denied | requester={user_id} | owner={data.get('user_id')}")
         raise HTTPException(status_code=403, detail="Access denied: you do not own this assessment")
 
-    assessment_json = data['assessment_data']
+    # Every format is built from the persisted final assessment state,
+    # never from the original AI-generation payload. Normalizing here supplies
+    # `question_order` for assessments saved before the editing workspace
+    # existed, so all formats share one sequence.
+    assessment_json = normalize_assessment(data['assessment_data'])
     tmp_dir = Path(tempfile.mkdtemp(prefix=f"assessment_{job_id}_"))
     background_tasks.add_task(shutil.rmtree, str(tmp_dir), True)
-    logger.info(f"[{job_id}] Generating {format} export | user={user_id}")
+    logger.info(
+        f"[{job_id}] Generating {format} export | version={data.get('version')} | "
+        f"questions={question_count(assessment_json)} | user={user_id}"
+    )
+    telemetry.emit(telemetry.build_event(
+        telemetry.TEL_ASSESSMENT_DOWNLOADED,
+        job_id=job_id, editor_id=user_id,
+        assessment_version=int(data.get("version") or 1),
+        format=format, question_count=question_count(assessment_json),
+    ))
 
     if format == "csv":
         path = tmp_dir / f"{job_id}_assessment_v2.csv"
@@ -486,7 +1469,12 @@ async def get_history_v1(user_id: str = Depends(get_current_user)):
             "course_ids": meta.get("course_ids", []),
             "course_names": meta.get("course_names", []),
             "config": meta.get("config", {}),
-            "error_message": item.get("error_message")
+            "error_message": item.get("error_message"),
+            # Lets a listing show which assessments have been
+            # reviewed without fetching each one's audit trail.
+            "version": int(item.get("version") or 1),
+            "edited": bool(item.get("edited_at")),
+            "edited_at": item["edited_at"].isoformat() if item.get("edited_at") else None,
         })
         
     return formatted_history
