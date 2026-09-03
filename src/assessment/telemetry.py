@@ -19,11 +19,9 @@ two places:
 
 The full event registry (22 events in total) is declared below so the codes
 are documented in one place. Groups A-C are emitted from the editing
-workspace. Of Groups D and E, call sites were added for Question Distribution
-Generated and Configuration Mismatch, which fire at *generation* time rather
-than edit time — see `emit_generation_event`. Course Selected, Course
-Removed, Question Generation Requested and Generation Limit Validation still
-have no call sites.
+workspace. Groups D and E describe *generation* time rather than edit time —
+see `emit_generation_event` for the helper they would be emitted through — and
+have no call sites yet.
 """
 
 from __future__ import annotations
@@ -61,14 +59,13 @@ TEL_SAVE_SUCCESSFUL = "TEL-14"
 TEL_ASSESSMENT_DOWNLOADED = "TEL-15"
 TEL_ASSESSMENT_REOPENED = "TEL-16"
 
-# Groups D and E — Question Distribution Generated and Configuration Mismatch
-# are emitted; the rest are declared for completeness and have no call sites.
+# Groups D and E — declared for completeness; these have no call sites.
 TEL_COURSE_SELECTED = "TEL-17"
 TEL_COURSE_REMOVED = "TEL-18"
-TEL_QUESTION_DISTRIBUTION_GENERATED = "TEL-19"  # emitted at generation time
+TEL_QUESTION_DISTRIBUTION_GENERATED = "TEL-19"
 TEL_QUESTION_GENERATION_REQUESTED = "TEL-20"
 TEL_GENERATION_LIMIT_VALIDATION = "TEL-21"
-TEL_CONFIGURATION_MISMATCH = "TEL-22"           # emitted at generation time
+TEL_CONFIGURATION_MISMATCH = "TEL-22"
 
 EVENT_NAMES: Dict[str, str] = {
     TEL_ASSESSMENT_EDIT_OPENED: "Assessment Edit Opened",
@@ -171,8 +168,7 @@ def build_generation_event(
     **fields: Any,
 ) -> Dict[str, Any]:
     """
-    Construct a generation-time event (Question Distribution Generated,
-    Configuration Mismatch).
+    Construct a generation-time event (Groups D and E).
 
     Deliberately not `build_event`: those events describe an *edit*, so they
     carry an `editor_id` and the resulting `assessment_version`. At generation
@@ -217,52 +213,14 @@ def emit_generation_event(
     **fields: Any,
 ) -> Dict[str, Any]:
     """
-    Emit a generation-time event and return it (Question Distribution
-    Generated, Configuration Mismatch).
+    Emit a generation-time event and return it (Groups D and E).
 
-    Question Distribution Generated carries the course-wise allocation and
-    the total; Configuration Mismatch carries the configured count against
-    the actual count. Both are observability-only —
-    neither is in `AUDITED_EVENTS`, because no assessment row exists yet for an
-    audit entry to hang off.
+    These are observability-only — none is in `AUDITED_EVENTS`, because no
+    assessment row exists yet for an audit entry to hang off.
     """
     event = build_generation_event(event_code, job_id=job_id, **fields)
     emit(event)
     return event
-
-
-def emit_distribution_generated(
-    *,
-    job_id: str,
-    allocation: Dict[str, int],
-    total_questions: int,
-    **fields: Any,
-) -> Dict[str, Any]:
-    """Question Distribution Generated."""
-    return emit_generation_event(
-        TEL_QUESTION_DISTRIBUTION_GENERATED,
-        job_id=job_id,
-        course_allocation=allocation,
-        total_questions=total_questions,
-        **fields,
-    )
-
-
-def emit_configuration_mismatch(
-    *,
-    job_id: str,
-    configured_count: int,
-    actual_count: int,
-    **fields: Any,
-) -> Dict[str, Any]:
-    """Configuration Mismatch."""
-    return emit_generation_event(
-        TEL_CONFIGURATION_MISMATCH,
-        job_id=job_id,
-        configured_count=configured_count,
-        actual_count=actual_count,
-        **fields,
-    )
 
 
 # Bulky payloads belong in the audit table, not in a telemetry event.

@@ -168,7 +168,7 @@ If a job with the same hash (course IDs + assessment type + difficulty + questio
 |---|---|---|---|
 | `practice` | Required | Optional | Reinforcement assessment for a single course |
 | `final` | Required | Optional | Summative/certification assessment for a single course |
-| `comprehensive` | Required (multiple) | Optional | Cross-course assessment; question count is split across courses via `course_allocation` (explicit per-course counts, preferred) or the legacy `course_weightage` percentage fallback |
+| `comprehensive` | Required (multiple) | Optional | Cross-course assessment; supports per-course weightage |
 | `standalone` | Uploaded files (PDF/VTT) | Optional | No course ID needed; content comes from uploaded files |
 | `competency` | Optional | **Required** | Pure KCM-aligned; works with or without course content |
 
@@ -211,7 +211,6 @@ ai-assessment-service/
 │       ├── api.py                   ← FastAPI app (API process)
 │       ├── worker_service.py        ← Kafka consumer (Worker process)
 │       ├── generator.py             ← LLM prompt engineering & parsing
-│       ├── allocation.py            ← Course-level question allocation (Comprehensive)
 │       ├── batching.py              ← Batch planning/merging for large assessments
 │       ├── blueprint.py             ← Assembles the assessment blueprint in Python (batched path)
 │       ├── questions.py             ← Editable question model: ids, ordering, provenance
@@ -278,18 +277,14 @@ The most complex file. Contains all prompt engineering logic.
 
 - Builds the full LLM prompt: system instructions + KCM context + course content + user config
 - Handles Bloom's taxonomy distribution across question types (proportional round-robin)
-- Resolves/verifies course allocation for Comprehensive assessments via `allocation.py`
 - For assessments larger than `QUESTION_BATCH_SIZE`, branches into a batched path: plans and merges parallel calls via `batching.plan_batches`/`merge_batches`, and assembles the blueprint in Python via `blueprint.build_blueprint` (imported as `blueprint_builder`) instead of asking the model for it
 - Sends the prompt to Google Gemini via `client.aio.models.generate_content`
 - Parses the structured JSON response (real field/answer/mapping validation lives in `validation.py`, applied on the editing endpoints, not here)
 - Handles Gemini context caching for the KCM descriptions (~60k tokens)
 - Returns `(metadata, assessment_data, usage_stats)`
 
-#### `allocation.py` — Course-level question allocation
-Pure functions (no I/O, no LLM, no DB) that make the Comprehensive question split deterministic: `compute_equal_allocation()` is the default equal split, `validate_allocation()` enforces that a user-supplied `course_allocation` still sums to `total_questions`, and `count_questions_by_course()` tallies what the LLM actually produced so drift is reported as a Configuration Mismatch instead of silent. Imported by `api.py` and `generator.py`.
-
 #### `batching.py` — Batch planning and merging
-Splits an assessment bigger than `QUESTION_BATCH_SIZE` into several parallel LLM calls (batched along the question-type axis, not by course) and merges the results back into one payload, preserving Bloom's-level ordering and per-course allocation across the split. Imported by `generator.py`.
+Splits an assessment bigger than `QUESTION_BATCH_SIZE` into several parallel LLM calls (batched along the question-type axis, not by course) and merges the results back into one payload, preserving Bloom's-level ordering across the split. Imported by `generator.py`.
 
 #### `blueprint.py` — Python-built assessment blueprint
 Assembles the assessment blueprint in Python for the batched generation path, since no single batched call sees the whole assessment and independently-written blueprints can't be merged. Imported by `generator.py` as `blueprint_builder`.
@@ -324,7 +319,7 @@ HTTP concerns, so the rules are identical no matter which endpoint drove the cha
 - Enforces the provenance transitions: `ai_generated` → `ai_assisted` on first edit; manually added questions are `human_authored` and stay so however often they are edited
 
 #### `telemetry.py` — TEL-* events
-Declares the full telemetry event registry in one place; the events from Assessment Edit Opened through Assessment Reopened are emitted from the editing workspace. Of Groups D and E, Question Distribution Generated and Configuration Mismatch are also emitted, from `api.py` and `generator.py` at generation time (allocation resolution/validation), not edit time. Course Selected, Course Removed, Question Generation Requested and Generation Limit Validation still have no call sites.
+Declares the full telemetry event registry in one place; the events from Assessment Edit Opened through Assessment Reopened are emitted from the editing workspace. Groups D and E (Course Selected, Course Removed, Question Distribution Generated, Question Generation Requested, Generation Limit Validation, Configuration Mismatch) describe generation time and have no call sites yet.
 
 | Event |
 |---|
@@ -601,8 +596,7 @@ Key form fields:
 | `question_type_counts` | JSON | ✅ | `{"mcq": 5, "ftb": 5, "mtf": 0, "multichoice": 0, "truefalse": 0}` |
 | `course_ids` | string | ✅* | Comma-separated course IDs (\*not needed for `standalone`/`competency`) |
 | `course_names` | string | ❌ | Names matching `course_ids` order — prevents N/A in history |
-| `course_allocation` | JSON | ❌ | Comprehensive only. Maps course IDs to explicit question counts; must sum to `total_questions`. Preferred over `course_weightage`. Omit for an equal split |
-| `course_weightage` | JSON | ❌ | Comprehensive only. Maps course IDs to weightage %. **Legacy** — prefer `course_allocation` |
+| `course_weightage` | JSON | ❌ | Comprehensive only. Maps course IDs to weightage % |
 | `language` | enum | ❌ | Default: `english`. Options: `hindi`, `tamil`, `telugu`, etc. |
 | `enable_blooms` | bool | ❌ | Default: `true`. Enable Bloom's distribution |
 | `blooms_config` | JSON | ❌ | `{"remember": 20, "understand": 30, ...}` — must sum to 100 |

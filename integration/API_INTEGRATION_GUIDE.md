@@ -113,25 +113,6 @@ curl --location 'https://portal.uat.karmayogibharat.net/api/ai/assessments/v1/ge
   --form 'force="false"'
 ```
 
-#### Comprehensive Assessment (multi-course, explicit allocation) — Kong
-
-```bash
-curl --location 'https://portal.uat.karmayogibharat.net/api/ai/assessments/v1/generate' \
-  --header 'x-authenticated-user-token: <keycloak_jwt>' \
-  --header 'Authorization: bearer <kong_jwt_credential>' \
-  --form 'course_ids="do_1144540583527301121908"' \
-  --form 'course_ids="do_113948972799877120197"' \
-  --form 'course_names="Foundations of Public Policy"' \
-  --form 'course_names="Ethics in Governance"' \
-  --form 'assessment_type="comprehensive"' \
-  --form 'difficulty="intermediate"' \
-  --form 'language="english"' \
-  --form 'total_questions="20"' \
-  --form 'question_type_counts="{\"mcq\":10,\"ftb\":5,\"mtf\":5,\"multichoice\":0,\"truefalse\":0}"' \
-  --form 'course_allocation="{\"do_1144540583527301121908\":12,\"do_113948972799877120197\":8}"' \
-  --form 'force="false"'
-```
-
 #### Competency Assessment — Kong
 
 ```bash
@@ -166,8 +147,7 @@ curl --location 'https://portal.uat.karmayogibharat.net/api/ai/assessments/v1/ge
 | `blooms_config` | JSON string | No | Keys: `Remember`, `Understand`, `Apply`, `Analyze`, `Evaluate`, `Create` | Percentage distribution across Bloom's levels. Values must sum to 100. Example: `{"Remember":20,"Understand":30,"Apply":30,"Analyze":10,"Evaluate":10,"Create":0}` |
 | `time_limit` | integer | No | `0` or any positive integer | Time limit in minutes. `0` means no limit. |
 | `topic_names` | string | No | Comma-separated topic names | Restrict question generation to specific topics within the course. Leave blank to use all topics. |
-| `course_allocation` | JSON string | No | `{"<course_id>": <question_count>, ...}` | Preferred mechanism to split questions across courses when `assessment_type` is `comprehensive`. Maps each course ID to an integer question count; values must sum to `total_questions`. Omit to get an equal distribution across the selected courses. Example: `{"do_1":12,"do_2":8}` |
-| `course_weightage` | JSON string | No | `{"<course_id>": <percent>, ...}` | **Legacy — prefer `course_allocation`.** Weightage per course when `assessment_type` is `comprehensive`. Values must sum to 100. Example: `{"do_1":60,"do_2":40}` |
+| `course_weightage` | JSON string | No | `{"<course_id>": <percent>, ...}` | Weightage per course when `assessment_type` is `comprehensive`. Values must sum to 100. Example: `{"do_1":60,"do_2":40}` |
 | `course_names` | string (repeated) | No | One value per field | Names matching the order of `course_ids`. Pass as repeated form fields. Used to populate history immediately without waiting for job completion. Example: `--form 'course_names="Foundations of Public Policy"' --form 'course_names="Ethics in Governance"'` |
 | `competency_area` | string | Yes* | Any valid KCM competency area | `*`Required when `assessment_type=competency`. e.g. `"Behavioural"` |
 | `competency_themes` | string (repeated) | Yes* | One value per field | `*`Required when `assessment_type=competency`. Pass as repeated form fields. e.g. `--form 'competency_themes="Service Orientation"' --form 'competency_themes="Decision Making"'` |
@@ -269,8 +249,6 @@ curl --location 'https://portal.uat.karmayogibharat.net/apis/proxies/v8/ai/asses
       "additional_instructions": null,
       "time_limit": null,
       "course_weightage": null,
-      "course_allocation": null,
-      "allocation_source": null,
       "competency_area": null,
       "competency_themes": [],
       "competency_sub_themes": []

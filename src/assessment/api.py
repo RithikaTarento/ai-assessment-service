@@ -22,10 +22,6 @@ from .cleanup import start_cleanup_scheduler, stop_cleanup_scheduler
 from .events import stop_kafka_producer, send_request_event
 from .exporters_csv_v2 import generate_csv_v2, generate_csv_basic
 from . import telemetry
-from .allocation import (
-    allocation_from_weightage, compute_equal_allocation, parse_allocation,
-    validate_allocation, weightage_from_allocation,
-)
 from .questions import normalize_assessment, ordered_questions, question_count
 from .validation import ValidationError, validate_assessment
 from .editing import (
@@ -156,8 +152,7 @@ async def generate_v1(
         description="JSON string of Bloom's percentage per level"
     ),
     enable_blooms: bool = Form(True, description="Enable or disable Bloom's taxonomy"),
-    course_weightage: Optional[str] = Form(None, description="JSON mapping course IDs to weightage % (Comprehensive Phase only). Legacy — prefer course_allocation."),
-    course_allocation: Optional[str] = Form(None, description="JSON mapping course IDs to question counts (Comprehensive only). Must sum to total_questions. Omit to get an equal distribution across the selected courses."),
+    course_weightage: Optional[str] = Form(None, description="JSON mapping course IDs to weightage % (Comprehensive Phase only)"),
     course_names: Optional[List[str]] = Form(None, description="Course names matching the order of course_ids. Pass as repeated fields or a single comma-separated value."),
     competency_area: Optional[str] = Form(None, description="Competency area (required for competency assessment type). e.g. 'Behavioural'"),
     competency_themes: Optional[List[str]] = Form(None, description="Competency themes (required for competency type). Pass as repeated fields or a single comma-separated value."),
@@ -229,37 +224,12 @@ async def generate_v1(
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON for blooms_config")
 
-    # --- 1b. Course allocation ---
-    # Comprehensive assessments split the configured question count across the
-    # selected courses. Resolved here rather than in the UI so that *every*
-    # caller — Streamlit, Postman, a Kong consumer — gets the same guarantee:
-    # an explicit, integer, summing allocation. Precedence is
-    #   user-supplied counts → legacy percentages → equal default.
-    resolved_allocation = None
-    allocation_source = None
-    if assessment_type == AssessmentType.COMPREHENSIVE and c_ids:
-        resolved_allocation = parse_allocation(course_allocation)
-        if resolved_allocation:
-            allocation_source = "user_override"
-        else:
-            # Legacy callers still send percentages; convert rather than
-            # ignore, so they also end up with an enforced allocation.
-            resolved_allocation = allocation_from_weightage(course_weightage, total_questions, c_ids)
-            allocation_source = "course_weightage" if resolved_allocation else None
-        if not resolved_allocation:
-            resolved_allocation = compute_equal_allocation(total_questions, c_ids)
-            allocation_source = "equal_default"
-
     # --- 2. Hashing (Same logic) ---
     import hashlib
     param_list = [
         str(assessment_type), str(difficulty), str(total_questions),
         str(q_counts), str(sorted(q_types)), str(time_limit),
-        str(topic_names), str(language), str(blooms_config), str(enable_blooms), str(course_weightage), str(additional_instructions),
-        # Part of the signature: two requests differing only in how the questions
-        # are split across courses are different assessments and must not share
-        # a cache entry.
-        str(sorted(resolved_allocation.items())) if resolved_allocation else "None",
+        str(topic_names), str(language), str(blooms_config), str(enable_blooms), str(course_weightage), str(additional_instructions)
     ]
     if files:
          param_list.extend([f.filename for f in valid_files])
@@ -282,34 +252,6 @@ async def generate_v1(
     user_job_id = f"{composite_id}_{user_id}"
 
     logger.info(f"[{user_job_id}] Generate request | user={user_id} | type={assessment_type} | courses={c_ids} | questions={total_questions} | language={language} | difficulty={difficulty} | force={force}")
-
-    # --- 2b. Enforce the allocation ---
-    # A user override is honoured, but only if it still sums to the configured
-    # question count. Validated after the job ID is known so the Configuration
-    # Mismatch event can name the assessment, and before any job is created so
-    # a bad request never persists.
-    if resolved_allocation is not None:
-        allocation_errors = validate_allocation(resolved_allocation, total_questions, c_ids)
-        if allocation_errors:
-            actual = sum(resolved_allocation.values())
-            logger.warning(f"[{user_job_id}] Invalid course allocation ({allocation_source}): {allocation_errors}")
-            telemetry.emit_configuration_mismatch(
-                job_id=user_job_id,
-                configured_count=total_questions,
-                actual_count=actual,
-                course_allocation=resolved_allocation,
-                errors=allocation_errors,
-            )
-            raise HTTPException(status_code=400, detail=" ".join(allocation_errors))
-
-        logger.info(f"[{user_job_id}] Course allocation ({allocation_source}): {resolved_allocation}")
-        telemetry.emit_distribution_generated(
-            job_id=user_job_id,
-            allocation=resolved_allocation,
-            total_questions=total_questions,
-            allocation_source=allocation_source,
-            course_weightage_percent=weightage_from_allocation(resolved_allocation, total_questions),
-        )
 
     # --- 3. Check Status (V2 Logic: Clone or Generate) ---
 
@@ -369,10 +311,6 @@ async def generate_v1(
             "language": language,
             "time_limit": time_limit,
             "course_weightage": course_weightage,
-            # The allocation the assessment was generated
-            # against, stored with the job so it can be reviewed afterwards.
-            "course_allocation": resolved_allocation,
-            "allocation_source": allocation_source,
             "competency_area": competency_area,
             "competency_themes": parsed_competency_themes,
             "competency_sub_themes": parsed_competency_sub_themes,
@@ -410,8 +348,6 @@ async def generate_v1(
         "blooms_distribution": b_dist,
         "enable_blooms": enable_blooms,
         "course_weightage": course_weightage,
-        "course_allocation": resolved_allocation,
-        "allocation_source": allocation_source,
         "question_types": q_types,
         "time_limit": time_limit,
         "competency_area": competency_area,

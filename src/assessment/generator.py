@@ -23,7 +23,6 @@ from .config import (
 )
 from . import telemetry
 from . import blueprint as blueprint_builder
-from .allocation import compare_allocation, count_questions_by_course, parse_allocation
 from .batching import Batch, merge_batches, plan_batches
 from .questions import BUCKET_BY_TYPE_KEY
 
@@ -142,80 +141,6 @@ async def _create_kcm_cache() -> Optional[str]:
         logger.error(f"Failed to create KCM cache: {e}")
         return None
 
-def _build_course_labels(
-    course_ids: Optional[List[str]],
-    course_names: Optional[List[str]],
-    aggregated_metadata: Optional[Dict[str, Any]] = None,
-) -> Dict[str, str]:
-    """
-    Map course ID → the human-readable name to use in the prompt.
-
-    Caller-supplied `course_names` win, since they came straight from the user's
-    selection. Otherwise fall back to the name in the course's own metadata,
-    matched on `identifier`. An ID with no name maps to nothing and the caller
-    falls back to the raw ID.
-    """
-    labels: Dict[str, str] = {}
-    for cid, name in zip(course_ids or [], course_names or []):
-        if cid and name and str(name).strip():
-            labels[cid] = str(name).strip()
-
-    for course in (aggregated_metadata or {}).get("courses", []) or []:
-        if not isinstance(course, dict):
-            continue
-        cid = course.get("identifier") or course.get("courseId")
-        name = course.get("name")
-        if cid and name and cid not in labels:
-            labels[cid] = str(name).strip()
-    return labels
-
-
-def verify_course_allocation(
-    assessment: Optional[Dict[str, Any]],
-    allocation: Optional[Dict[str, int]],
-    *,
-    job_id: Optional[str] = None,
-    total_questions: Optional[int] = None,
-    course_labels: Optional[Dict[str, str]] = None,
-) -> Dict[str, Dict[str, int]]:
-    """
-    Check the generated assessment against the requested allocation.
-
-    The allocation is an instruction to a language model, so it can be missed.
-    This makes that observable: any drift is logged and reported as a
-    Configuration Mismatch. It deliberately does not attempt to repair the
-    assessment — a corrective pass is a separate decision, and silently
-    reshuffling questions would hide the very thing this is here to surface.
-
-    Returns the per-course drift, empty when the generation matched.
-    """
-    if not allocation:
-        return {}
-
-    generated = count_questions_by_course(assessment)
-    drift = compare_allocation(allocation, generated, course_labels)
-    requested_total = total_questions if total_questions is not None else sum(allocation.values())
-    actual_total = sum(generated.values())
-
-    if not drift:
-        logger.info(f"[{job_id}] Course allocation satisfied: {allocation}")
-        return {}
-
-    logger.warning(
-        f"[{job_id}] Course allocation drift | requested={allocation} | "
-        f"generated={generated} | drift={drift}"
-    )
-    telemetry.emit_configuration_mismatch(
-        job_id=job_id or "unknown",
-        configured_count=requested_total,
-        actual_count=actual_total,
-        course_allocation=allocation,
-        generated_allocation=generated,
-        drift=drift,
-    )
-    return drift
-
-
 def format_question_type_instructions(question_type_counts: Dict[str, int]) -> str:
     """
     The per-type count block used by both the single-call and batch prompts.
@@ -317,38 +242,17 @@ def format_batch_blooms(blooms_by_type: Dict[str, List[str]]) -> str:
     )
 
 
-def build_course_distribution_instruction(
-    allocation: Optional[Dict[str, int]],
-    assessment_type: str,
-    course_label_by_id: Dict[str, str],
-    course_weightage: Optional[Any] = None,
-) -> str:
+def build_course_distribution_instruction(course_weightage: Optional[Any] = None) -> str:
     """
-    The per-course sourcing instruction for the course-allocation feature.
+    The per-course sourcing instruction, built from the weightage percentages.
 
-    Takes the allocation to use as an argument so a batch can be given its own
-    apportioned share rather than the whole assessment's counts — telling a batch
-    of 25 to draw "EXACTLY 50" from a course would guarantee drift.
+    Shared by the single-call and batch prompts so both phrase the instruction
+    identically.
     """
-    if allocation and assessment_type == "comprehensive":
-        lines = [
-            f"     - {course_label_by_id.get(cid, cid)} (source id: {cid}): EXACTLY {count} question(s)"
-            for cid, count in allocation.items()
-        ]
-        return (
-            "Draw questions from each course in these EXACT quantities. The counts below "
-            f"sum to {sum(allocation.values())} and MUST be met precisely - do not "
-            "round, rebalance, or move questions between courses:\n"
-            + "\n".join(lines)
-            + "\n     Set each question's `course_name` to the course it was drawn from, "
-            "spelled exactly as written above."
-        )
-
     if course_weightage:
-        # Legacy percentage path, kept for callers that predate the course-allocation feature.
         try:
             weights_dict = json.loads(course_weightage) if isinstance(course_weightage, str) else course_weightage
-            instruction_list = [f"{course_label_by_id.get(cid, cid)}: {weight}%" for cid, weight in weights_dict.items()]
+            instruction_list = [f"{cid}: {weight}%" for cid, weight in weights_dict.items()]
             return "Distribute the generated questions STRICTLY according to the following percentages:\n" + "\n".join(instruction_list)
         except Exception as e:
             logger.warning(f"Failed to parse course weightage '{course_weightage}' - falling back to equal distribution. Error: {e}")
@@ -422,7 +326,6 @@ async def generate_assessment(
     blooms_distribution: Optional[Dict[str, int]] = None,
     enable_blooms: bool = True,
     course_weightage: Optional[str] = None,
-    course_allocation: Optional[Dict[str, int]] = None,
     time_limit: Optional[int] = None,
     extra_files: Optional[List[Path]] = None,
     competency_area: Optional[str] = None,
@@ -628,18 +531,8 @@ async def generate_assessment(
     # 3. Format Topics
     topics_str = ", ".join(topic_names) if topic_names else "None specific (Cover all modules)"
 
-    # 4. Format Course Allocation / Weightage
-    #    Course names, not raw IDs: the model has to attribute content it sees
-    #    tagged as `--- SOURCE: <id> / ... ---`, and it also writes a
-    #    `course_name` on every question. Giving it both keeps the request and
-    #    the output speaking the same language, which is what makes the
-    #    post-generation check below meaningful.
-    course_label_by_id = _build_course_labels(course_ids, course_names, aggregated_metadata)
-    resolved_allocation = parse_allocation(course_allocation) if course_allocation else None
-
-    course_weightage_instruction = build_course_distribution_instruction(
-        resolved_allocation, assessment_type, course_label_by_id, course_weightage,
-    )
+    # 4. Format Course Weightage
+    course_weightage_instruction = build_course_distribution_instruction(course_weightage)
 
     # Build competency focus instruction for competency assessment type
     competency_focus_instruction = "Not applicable for this assessment type."
@@ -698,9 +591,6 @@ async def generate_assessment(
             question_type_counts=question_type_counts,
             blooms_by_type=blooms_by_type,
             blooms_str=blooms_str,
-            resolved_allocation=resolved_allocation,
-            course_ids=course_ids,
-            course_label_by_id=course_label_by_id,
             course_weightage=course_weightage,
             shared_prompt_inputs=shared_prompt_inputs,
             aggregated_metadata=aggregated_metadata,
@@ -712,19 +602,6 @@ async def generate_assessment(
             job_id=composite_id,
         )
 
-    # 7. Verify the course split survived generation.
-    if resolved_allocation and assessment_type == "comprehensive":
-        aggregated_metadata["course_allocation"] = resolved_allocation
-        drift = verify_course_allocation(
-            result_json,
-            resolved_allocation,
-            job_id=composite_id,
-            total_questions=total_questions,
-            course_labels=course_label_by_id,
-        )
-        if drift:
-            aggregated_metadata["course_allocation_drift"] = drift
-
     return aggregated_metadata, result_json, usage
 
 
@@ -733,9 +610,6 @@ async def _generate_in_batches(
     question_type_counts: Dict[str, int],
     blooms_by_type: Dict[str, List[str]],
     blooms_str: str,
-    resolved_allocation: Optional[Dict[str, int]],
-    course_ids: Optional[List[str]],
-    course_label_by_id: Dict[str, str],
     course_weightage: Optional[Any],
     shared_prompt_inputs: Dict[str, Any],
     aggregated_metadata: Dict[str, Any],
@@ -760,12 +634,7 @@ async def _generate_in_batches(
     """
     assessment_type = shared_prompt_inputs.get("assessment_type")
 
-    batches = plan_batches(
-        question_type_counts,
-        blooms_by_type,
-        resolved_allocation if assessment_type == "comprehensive" else None,
-        course_ids,
-    )
+    batches = plan_batches(question_type_counts, blooms_by_type)
     if not batches:
         raise ValueError("No questions were requested — nothing to generate.")
 
@@ -774,7 +643,7 @@ async def _generate_in_batches(
         f"{sum(b.total for b in batches)} questions"
     )
     for batch in batches:
-        logger.info(f"[{job_id}] {batch.describe()} | allocation={batch.allocation}")
+        logger.info(f"[{job_id}] {batch.describe()}")
 
     # return_exceptions=True is deliberate: the default would surface the first
     # failure while the remaining batches kept running unattended, burning tokens
@@ -785,7 +654,6 @@ async def _generate_in_batches(
             _generate_question_batch(
                 batch=batch,
                 blooms_str=blooms_str,
-                course_label_by_id=course_label_by_id,
                 course_weightage=course_weightage,
                 shared_prompt_inputs=shared_prompt_inputs,
                 job_id=job_id,
@@ -811,19 +679,6 @@ async def _generate_in_batches(
 
     payloads = [outcome for outcome, _ in results]
     usages = [usage for _, usage in results]
-
-    # Per-batch allocation check — names the batch that drifted
-    # rather than reporting one aggregate mismatch for the whole assessment.
-    if resolved_allocation and assessment_type == "comprehensive":
-        for batch, payload in zip(batches, payloads):
-            if batch.allocation:
-                verify_course_allocation(
-                    {"questions": payload},
-                    batch.allocation,
-                    job_id=f"{job_id}#batch{batch.index + 1}",
-                    total_questions=batch.total,
-                    course_labels=course_label_by_id,
-                )
 
     merged_questions = merge_batches(payloads)
 
@@ -880,7 +735,6 @@ async def _generate_question_batch(
     *,
     batch: Batch,
     blooms_str: str,
-    course_label_by_id: Dict[str, str],
     course_weightage: Optional[Any],
     shared_prompt_inputs: Dict[str, Any],
     job_id: Optional[str],
@@ -895,12 +749,7 @@ async def _generate_question_batch(
     prompt = build_batch_prompt(
         batch=batch,
         blooms_str=blooms_str,
-        course_weightage_instruction=build_course_distribution_instruction(
-            batch.allocation,
-            str(shared_prompt_inputs.get("assessment_type")),
-            course_label_by_id,
-            course_weightage,
-        ),
+        course_weightage_instruction=build_course_distribution_instruction(course_weightage),
         **shared_prompt_inputs,
     )
     schema = batch_questions_schema(list(batch.type_counts))

@@ -164,7 +164,7 @@ The 109 KCM competency definitions (~60k tokens) are uploaded to Gemini's contex
 |---|---|---|---|
 | `practice` | Course VTT/PDF | No | Single course reinforcement |
 | `final` | Course VTT/PDF | No | Summative / certification |
-| `comprehensive` | Multiple courses | No | Exact per-course question allocation (`course_allocation`), validated to sum to `total_questions` and checked for drift against what the LLM actually generated; the percentage `course_weightage` is a legacy fallback, converted internally into the same integer allocation |
+| `comprehensive` | Multiple courses | No | Supports per-course weightage |
 | `standalone` | Uploaded PDF/VTT | No | No course ID required |
 | `competency` | Optional | Yes | Purely KCM-aligned; works with or without course content |
 
@@ -184,11 +184,9 @@ When the requested per-type question counts sum to more than `QUESTION_BATCH_SIZ
 
 On this path the `blueprint` is not written by the LLM at all: no single batch sees the whole assessment, so independently-written blueprints could not be merged. Instead `blueprint.py` assembles the blueprint deterministically in Python from the request, the course metadata, and the questions the batches actually produced (e.g. `blooms_taxonomy_mapping` and `difficulty_distribution` are counted off the merged questions rather than authored by the model).
 
-For `comprehensive` assessments, the per-course allocation (Section 4.5) is likewise split across batches by `batching.apportion_allocation` so that each batch's counts sum to its own total and each course's counts sum to its global allocation, then re-verified per batch and for the assessment as a whole.
+### 4.8 Editing, Validation & Telemetry Modules
 
-### 4.8 Editing, Validation, Telemetry & Allocation Modules
-
-Beyond `generator.py`, the question-editing workspace and comprehensive-allocation features are implemented across several modules:
+Beyond `generator.py`, the question-editing workspace is implemented across several modules:
 
 | Module | Responsibility |
 |---|---|
@@ -196,9 +194,8 @@ Beyond `generator.py`, the question-editing workspace and comprehensive-allocati
 | `editing.py` | The editing operations (`apply_question_edit`, `apply_question_add`, `apply_question_delete`, `apply_question_reorder`, `diff_assessments`) as pure functions that return an updated assessment plus the audit/telemetry events the change produced. |
 | `validation.py` | The validation gate and pre-update alerts — `validate_question`/`validate_assessment` block saving an invalid question, and `build_change_alerts`/`build_delete_alerts` describe the impact of a pending edit or deletion. |
 | `telemetry.py` | The telemetry event registry — declares the full set of event codes, builds and emits events to the audit table and any registered sink, and distinguishes the audited events from the UI-reported and observability-only ones. |
-| `allocation.py` | Course-level question allocation for comprehensive assessments — `compute_equal_allocation`, `parse_allocation` and `validate_allocation` compute and validate an exact per-course integer split, replacing the old percentage `course_weightage` hint. |
 | `blueprint.py` | The deterministic blueprint builder used on the batched generation path (Section 4.7) — assembles the blueprint fields in Python from the request, course metadata and generated questions instead of asking the LLM for them. |
-| `batching.py` | Batch planning and merging for large assessments — `plan_batches` splits a request exceeding `QUESTION_BATCH_SIZE` into parallel per-question-type batches (preserving Bloom's level order and course allocation), and `merge_batches` recombines the results into one payload. |
+| `batching.py` | Batch planning and merging for large assessments — `plan_batches` splits a request exceeding `QUESTION_BATCH_SIZE` into parallel per-question-type batches (preserving Bloom's level order), and `merge_batches` recombines the results into one payload. |
 
 ---
 
@@ -347,8 +344,6 @@ the telemetry event set with live call sites outside the audit trail:
 | Save Failed | Any editing save that did not persist — a version conflict (`409`) or a blocked validation (`400`) — emitted from `_commit`/`_emit_validation_failure` in `api.py`. |
 | Save Successful | An editing save commits, emitted from `_commit` in `api.py` right after the DB write is confirmed. |
 | Assessment Downloaded | A client calls `GET /download/{job_id}`, emitted once per export regardless of format. |
-| Question Distribution Generated | A `comprehensive` request's per-course allocation is resolved (equal split, override, or converted from `course_weightage`), emitted from the `/generate` endpoint in `api.py`. |
-| Configuration Mismatch | The resolved allocation fails validation, or the generated assessment's per-course counts drift from what was requested — emitted from both `/generate` in `api.py` and `verify_course_allocation` in `generator.py`. |
 
 | Column | Type | Description |
 |---|---|---|
@@ -592,8 +587,7 @@ multipart/form-data fields:
   language               → english | hindi | tamil | telugu | kannada | malayalam | ...
   enable_blooms          → true | false
   blooms_config          → JSON: {"remember": 20, "understand": 30, "apply": 30, "analyze": 20}
-  course_allocation      → JSON: {"do_A": 15, "do_B": 10}  (comprehensive only; exact per-course question counts, must sum to total_questions — the preferred parameter)
-  course_weightage       → JSON: {"do_A": 60, "do_B": 40}  (comprehensive only; Legacy — prefer course_allocation. Percentage, converted internally into an exact allocation)
+  course_weightage       → JSON: {"do_A": 60, "do_B": 40}  (comprehensive only)
   competency_area        → string (competency type only)
   competency_themes      → comma-separated (competency type only)
   competency_sub_themes  → comma-separated (competency type only)

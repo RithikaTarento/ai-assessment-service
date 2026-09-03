@@ -5,44 +5,10 @@ import time
 import pandas as pd
 import json
 import os
-import sys
-from pathlib import Path
 from dotenv import load_dotenv
 
 # Load local .env if present
 load_dotenv()
-
-# Reuse the backend's allocation rules rather than restating them here,
-# so the table this page shows is computed exactly the way the API computes it.
-# The fallback keeps the page usable if it is run somewhere `src/` is not present;
-# the API validates the allocation regardless, so the two can never diverge
-# silently.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-try:
-    from assessment.allocation import allocation_from_weightage, compute_equal_allocation
-except ImportError:  # pragma: no cover — standalone UI deployment
-    def compute_equal_allocation(total, course_ids):
-        ordered = []
-        for cid in course_ids:
-            if cid and cid not in ordered:
-                ordered.append(cid)
-        if not ordered:
-            return {}
-        base, remainder = divmod(total, len(ordered))
-        return {cid: base + (1 if i < remainder else 0) for i, cid in enumerate(ordered)}
-
-    def allocation_from_weightage(weightage, total, course_ids=None):
-        parsed = {c: w for c, w in (weightage or {}).items() if course_ids is None or c in course_ids}
-        weight_total = sum(parsed.values())
-        if not parsed or weight_total <= 0:
-            return None
-        exact = {cid: w * total / weight_total for cid, w in parsed.items()}
-        alloc = {cid: int(v) for cid, v in exact.items()}
-        order = list(exact)
-        ranked = sorted(order, key=lambda c: (-(exact[c] - alloc[c]), order.index(c)))
-        for i in range(total - sum(alloc.values())):
-            alloc[ranked[i % len(ranked)]] += 1
-        return alloc
 
 # --- Configuration ---
 # Default to localhost for local testing
@@ -237,11 +203,11 @@ with tab_gen:
 # ==========================================
 with tab_comp:
     st.markdown("### 📚 Comprehensive Assessment Builder")
-    st.info("Combine multiple courses into one cross-course assessment. The configured question count is split equally across the selected courses by default — you can override the split per course below.")
+    st.info("Combine multiple courses with specific percentage weightages to generate a comprehensive cross-course assessment.")
 
     # Dynamic Course Inputs
     if "comp_courses" not in st.session_state:
-        st.session_state.comp_courses = [{"id": "", "name": ""}, {"id": "", "name": ""}]
+        st.session_state.comp_courses = [{"id": "", "name": "", "weight": 50}, {"id": "", "name": "", "weight": 50}]
 
     # Adding and removing courses runs through `on_click` callbacks rather than
     # mutate-then-`st.rerun()`. A rerun raised from up here aborts the script
@@ -250,42 +216,58 @@ with tab_comp:
     # reset the user's question counts to their defaults. A callback runs before
     # the rerun, so the script then executes in full and every widget survives.
     def _add_course():
-        st.session_state.comp_courses.append({"id": "", "name": ""})
+        st.session_state.comp_courses.append({"id": "", "name": "", "weight": 0})
 
     def _remove_course(index):
-        # The typed values live in widget state (`cid_i` / `cname_i`), not in
-        # `comp_courses`, so removing a row means compacting that state by hand —
-        # otherwise the rows below shift up and show the wrong course.
+        # The typed values live in widget state (`cid_i` / `cname_i` / `cw_i`),
+        # not in `comp_courses`, so removing a row means compacting that state by
+        # hand — otherwise the rows below shift up and show the wrong course.
         rows = len(st.session_state.comp_courses)
         ids = [st.session_state.get(f"cid_{i}", "") for i in range(rows)]
         names = [st.session_state.get(f"cname_{i}", "") for i in range(rows)]
+        weights = [st.session_state.get(f"cw_{i}", 0) for i in range(rows)]
         ids.pop(index)
         names.pop(index)
+        weights.pop(index)
         st.session_state.comp_courses.pop(index)
-        for i, (cid, cname) in enumerate(zip(ids, names)):
+        for i, (cid, cname, weight) in enumerate(zip(ids, names, weights)):
             st.session_state[f"cid_{i}"] = cid
             st.session_state[f"cname_{i}"] = cname
+            st.session_state[f"cw_{i}"] = weight
         st.session_state.pop(f"cid_{len(ids)}", None)
         st.session_state.pop(f"cname_{len(ids)}", None)
+        st.session_state.pop(f"cw_{len(ids)}", None)
 
-    st.markdown("#### Input Courses")
+    st.markdown("#### Input Courses & Weights")
 
     course_data = []
+    total_weight = 0
     for i, course in enumerate(st.session_state.comp_courses):
-        col1, col2, col3 = st.columns([5, 5, 1])
+        col1, col2, col3, col4 = st.columns([4, 4, 2, 1])
         with col1:
             c_id = st.text_input(f"Course ID {i+1}", value=course["id"], key=f"cid_{i}")
         with col2:
             c_name = st.text_input(f"Course Name {i+1}", value=course.get("name", ""), placeholder="e.g. Ethics in Governance", key=f"cname_{i}")
         with col3:
+            # Clamped to the widget's own minimum: a freshly added row carries no
+            # weight yet, and Streamlit refuses a starting value below min_value.
+            c_w = st.number_input(f"Weight (%)", min_value=1, max_value=100,
+                                  value=max(1, int(course.get("weight") or 0)), key=f"cw_{i}")
+        with col4:
             st.write("")
             st.write("")
             st.button("🗑️", key=f"del_{i}", on_click=_remove_course, args=(i,),
                       disabled=len(st.session_state.comp_courses) <= 1)
 
-        course_data.append({"id": c_id, "name": c_name})
+        course_data.append({"id": c_id, "name": c_name, "weight": c_w})
+        total_weight += c_w
 
     st.button("➕ Add Another Course", on_click=_add_course)
+
+    if total_weight != 100:
+        st.warning(f"⚠️ Total weight is currently {total_weight}%. It should ideally sum to 100%.")
+    else:
+        st.success("✅ Total weight is exactly 100%!")
 
     # Standard Configs
     st.markdown("#### Configuration")
@@ -333,148 +315,19 @@ with tab_comp:
     
     total_q = cmcq + cftb + cmtf + cmulti + ctf
 
-    # ------------------------------------------------------------------
-    # Course-level question distribution
-    # ------------------------------------------------------------------
-    st.markdown("#### Question Distribution Across Courses")
-
-    valid_courses = [c for c in course_data if c["id"].strip()]
-    comp_c_ids = [c["id"].strip() for c in valid_courses]
-    comp_allocation = {}
-    comp_weights = {}
-    allocation_ok = False
-
-    if not comp_c_ids:
-        st.caption("Enter at least one Course ID above to see the question distribution.")
-    else:
-        # The default is recalculated whenever the configuration that
-        # determines it changes: the set of selected courses or the
-        # total question count. Any earlier override is replaced.
-        #
-        # Weightage is what the user edits; the question counts are derived from
-        # it. Keeping the percentage as the input is what lets an equal default
-        # *look* equal — an equal share of 10 questions across 3 courses is
-        # 33.3% each even though the counts can only be 4/3/3.
-        signature = (tuple(comp_c_ids), total_q)
-        if st.session_state.get("comp_alloc_signature") != signature:
-            # Whole-number percentages that add up to exactly 100. The same
-            # equal-split helper does the work with a total of 100 instead of a
-            # question count, so any remainder lands on the leading courses —
-            # the first course therefore carries the highest weight.
-            default_weights = compute_equal_allocation(100, comp_c_ids)
-            for idx, cid in enumerate(comp_c_ids):
-                # Written straight into widget state so the inputs themselves
-                # reset — Streamlit ignores `value=` once a key exists.
-                st.session_state[f"comp_weight_{idx}"] = default_weights.get(cid, 0)
-            st.session_state.comp_alloc_signature = signature
-
-        st.caption(
-            "Weightage defaults to an equal share across the selected courses, as whole "
-            "percentages totalling 100%. Edit any percentage to override. Question counts are "
-            "derived from the weightage and always add up to the configured total."
-        )
-
-        h1, h2, h3 = st.columns([5, 2, 2])
-        h1.markdown("**Course**")
-        h2.markdown("**Weightage**")
-        h3.markdown("**Questions**")
-
-        weight_inputs = {}
-        for idx, course in enumerate(valid_courses):
-            cid = course["id"].strip()
-            weight_inputs[cid] = st.session_state.get(f"comp_weight_{idx}", 0)
-
-        # Derived here so the read-only counts shown on each row are the same
-        # numbers that get submitted — largest-remainder, so they sum exactly.
-        #
-        # While the weightage is still the untouched equal default, the counts
-        # come from splitting the total directly rather than from the
-        # rounded percentages. Whole-number percentages carry rounding error that
-        # compounds at larger totals — 6 courses at 17/17/17/17/16/16 would turn
-        # 250 questions into 43/43/42/42/40/40, a spread of three, when an equal
-        # split is 42/42/42/42/41/41. Deriving from the total keeps the default
-        # genuinely equal; the percentages remain the display of that intent.
-        # Once the user edits a percentage, their numbers drive the counts.
-        if weight_inputs == compute_equal_allocation(100, comp_c_ids):
-            comp_allocation = compute_equal_allocation(total_q, comp_c_ids)
-        else:
-            comp_allocation = allocation_from_weightage(weight_inputs, total_q, comp_c_ids) or {}
-
-        for idx, course in enumerate(valid_courses):
-            cid = course["id"].strip()
-            label = course["name"].strip() or cid
-            r1, r2, r3 = st.columns([5, 2, 2])
-            r1.write(label)
-            weight = r2.number_input(
-                "Weightage", min_value=0, max_value=100, step=1,
-                key=f"comp_weight_{idx}", label_visibility="collapsed",
-            )
-            comp_weights[cid] = int(weight)
-            r3.write(str(comp_allocation.get(cid, 0)))
-
-        weight_total = sum(comp_weights.values())
-        allocated = sum(comp_allocation.values())
-        t1, t2, t3 = st.columns([5, 2, 2])
-        t1.markdown("**Total**")
-        t2.markdown(f"**{weight_total}%**")
-        t3.markdown(f"**{allocated}**")
-
-        # The equal default always totals exactly 100%,
-        # so this only ever fires on an override.
-        if weight_total != 100:
-            st.error(f"⚠️ Weightage totals {weight_total}% — it must add up to 100%.")
-        elif total_q == 0:
-            st.warning("Set at least one question count above.")
-        else:
-            allocation_ok = True
-            # Compared on the weightage the user actually edits, not on the
-            # derived counts — two different weightages can round to the same
-            # counts at small totals.
-            if comp_weights == compute_equal_allocation(100, comp_c_ids):
-                courses = len(comp_c_ids)
-                note = ""
-                if 100 % courses:
-                    # Whole-number percentages cannot be identical when 100 does
-                    # not divide by the course count; the leading courses take
-                    # the extra point.
-                    note = (
-                        f" 100% does not divide evenly by {courses}, so the leading "
-                        f"course(s) carry the extra percentage point."
-                    )
-                st.success(
-                    f"✅ Equal distribution across {courses} course(s), "
-                    f"totalling {total_q} questions.{note}"
-                )
-            else:
-                st.success(f"✅ Custom weightage, totalling {total_q} questions.")
-
-        # Clearing the signature makes the recalculation block above fire on the
-        # next run, which is the only point at which the weightage widgets can be
-        # written to — Streamlit forbids assigning to a widget's key once the
-        # widget has been instantiated, and by here they have been.
-        st.button("↺ Reset to equal weightage",
-                  on_click=lambda: st.session_state.pop("comp_alloc_signature", None))
-
     if st.button("Generate Comprehensive", type="primary"):
         if not auth_token:
             st.error("Please enter an Auth Token in the sidebar first.")
             st.stop()
-            
+
+        valid_courses = [c for c in course_data if c["id"].strip()]
         if len(valid_courses) < 2:
             st.error("A comprehensive assessment requires at least 2 valid courses.")
             st.stop()
 
-        # The allocation must be settled and balanced before generating.
-        if not allocation_ok:
-            st.error("Fix the course question distribution above before generating.")
-            st.stop()
-
         c_ids = [c["id"].strip() for c in valid_courses]
         c_names = [c.get("name", "").strip() for c in valid_courses]
-        # The weightage the user set, and the exact counts derived from it. The
-        # counts are what generation is held to, so they are sent explicitly
-        # rather than left for the API to re-derive.
-        c_weights = dict(comp_weights)
+        c_weights = {c["id"].strip(): c["weight"] for c in valid_courses}
 
         comp_q_counts = {"mcq": cmcq, "ftb": cftb, "mtf": cmtf, "multichoice": cmulti, "truefalse": ctf}
         comp_payload = {
@@ -486,7 +339,6 @@ with tab_comp:
             'question_type_counts': json.dumps(comp_q_counts),
             'language': comp_lang,
             'enable_blooms': 'true' if comp_enable_blooms else 'false',
-            'course_allocation': json.dumps(comp_allocation),
             'course_weightage': json.dumps(c_weights)
         }
         if any(c_names):
@@ -1445,20 +1297,7 @@ with tab_history:
                             active = ", ".join(f"{k.upper()}:{v}" for k, v in q_counts.items() if v > 0)
                             st.write(f"- **Question Types:** {active}")
                         st.write(f"- **Time Limit:** {config.get('time_limit', 0) or 'No limit'}")
-                        # The allocation the assessment was
-                        # generated against is kept on the job and shown here.
-                        if config.get('course_allocation'):
-                            alloc = config['course_allocation']
-                            if isinstance(alloc, str):
-                                try:
-                                    alloc = json.loads(alloc)
-                                except json.JSONDecodeError:
-                                    alloc = {}
-                            if alloc:
-                                summary = ", ".join(f"{cid}: {n}" for cid, n in alloc.items())
-                                source = config.get('allocation_source') or 'unknown'
-                                st.write(f"- **Course Allocation** ({source}): {summary}")
-                        elif config.get('course_weightage'):
+                        if config.get('course_weightage'):
                             st.write(f"- **Course Weightage:** `{config.get('course_weightage')}`")
                     else:
                         st.write("No configuration metadata available (Legacy Job).")

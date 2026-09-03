@@ -110,7 +110,6 @@ async def process_job(payload: Dict[str, Any]):
                 blooms_distribution=payload.get('blooms_distribution'),
                 enable_blooms=payload.get('enable_blooms', True),
                 course_weightage=payload.get('course_weightage'),
-                course_allocation=payload.get('course_allocation'),
                 time_limit=payload.get('time_limit'),
                 extra_files=extra_files,
                 competency_area=payload.get('competency_area'),
@@ -138,10 +137,6 @@ async def process_job(payload: Dict[str, Any]):
             "language": payload.get('language'),
             "time_limit": payload.get('time_limit'),
             "course_weightage": payload.get('course_weightage'),
-            # Retained on the stored result. Only reached for
-            # legacy payloads that predate the API sending a prebuilt `config`.
-            "course_allocation": payload.get('course_allocation'),
-            "allocation_source": payload.get('allocation_source'),
             "competency_area": payload.get('competency_area'),
             "competency_themes": payload.get('competency_themes'),
             "competency_sub_themes": payload.get('competency_sub_themes'),

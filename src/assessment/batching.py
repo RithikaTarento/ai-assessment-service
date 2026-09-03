@@ -9,8 +9,7 @@ Batching is along the **question-type axis only**. Course-scoped batches were
 deliberately rejected: a comprehensive assessment is instructed to prefer
 cross-course scenario questions (see resources/prompts.yaml), which a batch that
 can only see one course is structurally incapable of writing. Every batch
-therefore receives the full content context, and the per-course allocation is
-split across batches instead.
+therefore receives the full content context.
 
 Within those batches the types are *grouped*: a type is kept whole in a single
 batch whenever the batch count allows it, and MTF is grouped ahead of every
@@ -22,7 +21,7 @@ plain sequential packing needs, and grouping only redistributes within it. Where
 grouping is impossible (see `_pack_grouped`) the sequential plan is used
 unchanged.
 
-Two invariants have to survive the split. Both are structural here rather than
+One invariant has to survive the split, and it is structural here rather than
 checked after the fact:
 
   * **Bloom's levels.** `generator.compute_blooms_by_type` already produces the
@@ -32,12 +31,6 @@ checked after the fact:
     by construction. Index arithmetic across a type that is split over several
     batches *and* packed alongside other types is precisely where an off-by-one
     hides, and a wrong Bloom's level is close to invisible in review.
-
-  * **Course allocation.** Each batch's counts must sum to its own total, and
-    each course's counts across all batches must sum to its global allocation.
-    Achieved by dealing out individual course "slots", not by rounding per
-    batch: independent largest-remainder rounding does not sum. A 50/50 split
-    over four batches of 25 rounds to 13/12 in every batch, giving 52/48.
 
 Everything here is pure — no I/O, no LLM, no DB.
 """
@@ -77,7 +70,6 @@ class Batch:
     index: int
     type_counts: Dict[str, int]
     blooms_by_type: Dict[str, List[str]] = field(default_factory=dict)
-    allocation: Optional[Dict[str, int]] = None
 
     @property
     def total(self) -> int:
@@ -316,9 +308,9 @@ def _pack_grouped(
     # Order batches the way the sequential packer would have: by the
     # canonical position of the earliest type each one holds. Purely so the
     # merged payload and the logs read the same as before — but it has to happen
-    # HERE, before `plan_batches` slices Bloom's levels and course allocations
-    # positionally against this list. Reordering afterwards silently pairs each
-    # batch with another batch's levels and quotas.
+    # HERE, before `plan_batches` slices Bloom's levels positionally against this
+    # list. Reordering afterwards silently pairs each batch with another batch's
+    # levels.
     packed.sort(key=lambda b: min(position[t] for t in b))
     return packed
 
@@ -429,75 +421,14 @@ def slice_blooms(
     return out
 
 
-def apportion_allocation(
-    global_allocation: Optional[Dict[str, int]],
-    batch_totals: List[int],
-    course_ids: Optional[List[str]] = None,
-) -> List[Optional[Dict[str, int]]]:
-    """
-    Split a per-course allocation across batches.
-
-    Guarantees, both by construction:
-      * every batch's counts sum to that batch's own question total
-      * every course's counts across all batches sum to its global allocation
-
-    Works by expanding the allocation into a flat list of one slot per question
-    and chunking that list, so no rounding is involved at any point. Slots are
-    emitted by repeatedly taking the course with the most remaining, which also
-    spreads courses evenly across batches — important, because a batch that
-    ended up holding a single course would silently reintroduce the
-    course-scoped batching that was rejected for blocking cross-course
-    questions.
-    """
-    if not global_allocation:
-        return [None] * len(batch_totals)
-
-    # Selection order first (matches allocation.compute_equal_allocation, which
-    # hands remainders to the courses the user listed first), unknowns after.
-    order = [cid for cid in (course_ids or []) if cid in global_allocation]
-    order += [cid for cid in global_allocation if cid not in order]
-    if not order:
-        return [None] * len(batch_totals)
-
-    remaining = {cid: max(0, int(global_allocation.get(cid) or 0)) for cid in order}
-    position = {cid: i for i, cid in enumerate(order)}
-
-    slots: List[str] = []
-    for _ in range(sum(remaining.values())):
-        cid = max(order, key=lambda c: (remaining[c], -position[c]))
-        slots.append(cid)
-        remaining[cid] -= 1
-
-    requested = sum(max(0, int(t)) for t in batch_totals)
-    if len(slots) != requested:
-        # The allocation and the question count disagree upstream. Not this
-        # module's call to repair — surface it and apportion what exists.
-        logger.warning(
-            "Course allocation sums to %d but the batches need %d questions; "
-            "per-batch allocation will be incomplete.",
-            len(slots), requested,
-        )
-
-    out: List[Optional[Dict[str, int]]] = []
-    cursor = 0
-    for total in batch_totals:
-        chunk = slots[cursor:cursor + max(0, int(total))]
-        cursor += max(0, int(total))
-        out.append(dict(Counter(chunk)))
-    return out
-
-
 def plan_batches(
     question_type_counts: Dict[str, int],
     blooms_by_type: Optional[Dict[str, List[str]]] = None,
-    allocation: Optional[Dict[str, int]] = None,
-    course_ids: Optional[List[str]] = None,
 ) -> List[Batch]:
     """
     Build the full batch plan.
 
-    `blooms_by_type` is empty when Bloom's is disabled, and `allocation` is None
-    for every assessment type except comprehensive — both are handled.
+    `blooms_by_type` is empty when Bloom's is disabled — that is handled.
     """
     type_counts_per_batch = plan_type_counts(question_type_counts or {})
     if not type_counts_per_batch:
@@ -509,18 +440,11 @@ def plan_batches(
         if levels
     }
 
-    allocations = apportion_allocation(
-        allocation,
-        [sum(counts.values()) for counts in type_counts_per_batch],
-        course_ids,
-    )
-
     batches = [
         Batch(
             index=i,
             type_counts=counts,
             blooms_by_type=slice_blooms(blooms_queues, counts),
-            allocation=allocations[i],
         )
         for i, counts in enumerate(type_counts_per_batch)
     ]
@@ -569,24 +493,6 @@ def _assert_plan_is_complete(
                 f"original assignment (got {len(reassembled)} levels, "
                 f"expected {len(expected)})"
             )
-
-    # Course allocations are chunked positionally against the batch totals, so a
-    # batch holding another batch's quotas is invisible except as drift reported
-    # on every batch at generation time. Checked only when the allocation covers
-    # the whole assessment — when it does not, `apportion_allocation` has already
-    # warned and the short chunks are expected.
-    allocated = [b for b in batches if b.allocation is not None]
-    if allocated and sum(sum(b.allocation.values()) for b in allocated) == sum(
-        b.total for b in batches
-    ):
-        for batch in allocated:
-            if sum(batch.allocation.values()) != batch.total:
-                raise ValueError(
-                    f"Course allocation for batch {batch.index + 1} sums to "
-                    f"{sum(batch.allocation.values())} but the batch holds "
-                    f"{batch.total} questions — the allocations are paired with "
-                    f"the wrong batches."
-                )
 
 
 def _unwrap_questions(result: Any) -> Dict[str, Any]:

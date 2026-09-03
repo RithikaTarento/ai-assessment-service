@@ -83,7 +83,7 @@ system_prompt_template: |
       - Competency structure:
         competency_area → competency_theme → competency_sub_theme
         
-  13. Course Question Distribution:
+  13. Course Weightage Distribution:
       {course_weightage_instruction}
 
   14. Competency Focus (MANDATORY if assessment_type = competency):
@@ -135,10 +135,7 @@ system_prompt_template: |
   - Prefer cross-course, real-world scenario questions
   - Focus primarily on Apply, Analyze, Evaluate Bloom levels
   - Do NOT create course-wise sections in questions
-  - You MUST meet the per-course quantities given in Course Question Distribution
-    exactly. That is a sourcing constraint on where questions come from, NOT an
-    instruction to group or section the output.
-  - Every question MUST carry the `course_name` of the course it was drawn from.
+  - You MUST strictly respect the Course Weightage Distribution percentages provided across the questions.
 
   If assessment_type = standalone:
   - Scope strictly limited to provided uploaded files/content context
@@ -423,7 +420,7 @@ batch_prompt_template: |
       - Competency structure:
         competency_area → competency_theme → competency_sub_theme
 
-  13. Course Question Distribution FOR THIS PART:
+  13. Course Weightage Distribution:
       {course_weightage_instruction}
 
   14. Competency Focus (MANDATORY if assessment_type = competency):
@@ -474,10 +471,7 @@ batch_prompt_template: |
   - Prefer cross-course, real-world scenario questions
   - Focus primarily on Apply, Analyze, Evaluate Bloom levels
   - Do NOT create course-wise sections in questions
-  - You MUST meet the per-course quantities given in input 13 exactly. That is a
-    sourcing constraint on where questions come from, NOT an instruction to group
-    or section the output.
-  - Every question MUST carry the `course_name` of the course it was drawn from.
+  - You MUST strictly respect the Course Weightage Distribution percentages provided across the questions.
 
   If assessment_type = standalone:
   - Scope strictly limited to provided uploaded files/content context
