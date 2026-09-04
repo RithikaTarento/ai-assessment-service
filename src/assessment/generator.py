@@ -7,6 +7,8 @@ import time
 import random
 import yaml
 import fitz  # PyMuPDF
+import re
+from collections import Counter
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List
 from google import genai
@@ -18,12 +20,10 @@ from .config import (
     DATABASE_URL,
     GOOGLE_PROJECT_ID, GOOGLE_LOCATION, GENAI_MODEL_NAME,
     GOOGLE_APPLICATION_CREDENTIALS, PROMPT_VERSION, INTERACTIVE_COURSES_PATH,
-    QUESTION_BATCH_SIZE, LLM_MAX_CONCURRENCY, BATCH_MAX_ATTEMPTS,
-    ENABLE_QUESTION_BATCHING, BATCH_TEMPERATURE,
+    QUESTION_BATCH_SIZE, BATCH_MAX_ATTEMPTS, ENABLE_QUESTION_BATCHING,
 )
 from . import telemetry
-from . import blueprint as blueprint_builder
-from .batching import Batch, merge_batches, plan_batches
+from .batching import Batch, apportion, merge_batches, plan_batches, summarize_for_dedup
 from .questions import BUCKET_BY_TYPE_KEY
 
 logger = logging.getLogger(__name__)
@@ -64,44 +64,33 @@ ASSESSMENT_SCHEMA = ASSESSMENT_SCHEMA_FILE.get('full_schema', {})
 KCM_DATASET = load_json('competencies.json')
 KCM_DESCRIPTIONS_FILE = load_json('kcm_descriptions.json')
 
-# Sub-schema for the batched path, derived rather than duplicated so it cannot
-# drift from resources/schemas.json. A batch returns the question buckets alone —
-# there is no blueprint in a batch response.
-QUESTIONS_SCHEMA = (ASSESSMENT_SCHEMA.get('properties') or {}).get('questions', {})
 
-
-def batch_questions_schema(type_keys: List[str]) -> Dict[str, Any]:
+def schema_without_blueprint() -> Dict[str, Any]:
     """
-    `QUESTIONS_SCHEMA` narrowed to the buckets one batch actually produces.
+    `ASSESSMENT_SCHEMA` with the `blueprint` key removed.
 
-    `questions.required` lists all five buckets, so without narrowing, a batch
-    asked only for MCQs would still have to emit four empty arrays.
+    Used by every batch except the last. The last batch authors the blueprint and
+    therefore goes out with `ASSESSMENT_SCHEMA` untouched — its call is
+    configured identically to a single-call request.
+
+    Derived rather than duplicated so it cannot drift from resources/schemas.json.
+    Note the `questions` object is NOT narrowed: it keeps all five buckets
+    required, so a batch emits empty arrays for the types it was told not to
+    generate — exactly as a single call with a zero count for a type does.
     """
-    buckets = [
-        BUCKET_BY_TYPE_KEY[key] for key in type_keys if key in BUCKET_BY_TYPE_KEY
-    ]
-    properties = QUESTIONS_SCHEMA.get('properties') or {}
-    if not buckets:
-        return QUESTIONS_SCHEMA
-
+    properties = ASSESSMENT_SCHEMA.get('properties') or {}
     narrowed = {
-        key: value for key, value in QUESTIONS_SCHEMA.items()
+        key: value for key, value in ASSESSMENT_SCHEMA.items()
         if key not in ('properties', 'required')
     }
-    narrowed['properties'] = {b: properties[b] for b in buckets if b in properties}
-    narrowed['required'] = [b for b in buckets if b in properties]
+    narrowed['properties'] = {k: v for k, v in properties.items() if k != 'blueprint'}
+    narrowed['required'] = [
+        r for r in (ASSESSMENT_SCHEMA.get('required') or []) if r != 'blueprint'
+    ]
     return narrowed
 
 
 _active_kcm_cache = None
-# Batches run in parallel, so the check-then-create in get_or_create_kcm_cache
-# would otherwise be a race: every batch of a cold job sees None and creates its
-# own cache, leaving duplicates billed and orphaned.
-_kcm_cache_lock = asyncio.Lock()
-# Bounds in-flight LLM calls process-wide, not per job. Without it, concurrent
-# batches across concurrent jobs exhaust the Vertex quota — _should_retry then
-# handles the 429s, but the calls should not have been made at once.
-_llm_semaphore = asyncio.Semaphore(max(1, LLM_MAX_CONCURRENCY))
 
 async def get_or_create_kcm_cache() -> str:
     global _active_kcm_cache
@@ -111,16 +100,6 @@ async def get_or_create_kcm_cache() -> str:
     if not client or not KCM_DESCRIPTIONS_FILE:
         return None
 
-    async with _kcm_cache_lock:
-        # Re-check inside the lock: several batches can arrive here together and
-        # only the first should create the cache.
-        if _active_kcm_cache:
-            return _active_kcm_cache
-        return await _create_kcm_cache()
-
-
-async def _create_kcm_cache() -> Optional[str]:
-    global _active_kcm_cache
     try:
         cache_content = [
              types.Content(role="user", parts=[
@@ -196,12 +175,16 @@ _TYPE_LABELS = {
 
 def format_blooms_by_type(blooms_by_type: Dict[str, List[str]]) -> str:
     """
-    The positional per-type Bloom's block used by the single-call prompt.
+    The positional per-type Bloom's block.
 
-    Extracted from `generate_assessment` unchanged so that path's wording is
-    untouched. The batch prompt uses `format_batch_blooms` instead, because
-    "the Nth question of that type" is ambiguous to a call that holds only part
-    of the assessment.
+    Used unchanged by both paths. `compute_blooms_by_type` is called once, on the
+    whole request, exactly as the single-call path calls it; a batch is handed a
+    contiguous slice of the result and renders it through this same function.
+
+    The positional rule ("the Nth level listed = the Nth question of that type")
+    resolves correctly inside a batch without rewording: the batch is shown only
+    its own slice, numbered from one, and generates exactly that many of that
+    type. It never has to know which slice it holds.
     """
     lines = []
     for qtype, levels in blooms_by_type.items():
@@ -217,43 +200,154 @@ def format_blooms_by_type(blooms_by_type: Dict[str, List[str]]) -> str:
     )
 
 
-def format_batch_blooms(blooms_by_type: Dict[str, List[str]]) -> str:
+def format_previously_generated(digest: List[Dict[str, str]]) -> str:
     """
-    The Bloom's block for one batch, numbered question by question.
+    The "already generated" block appended to every batch after the first.
 
-    The single-call form states a positional rule ("the Nth level = the Nth
-    question of that type"). A batch holds a slice of the assessment and has no
-    way to know which slice, so that rule cannot be resolved. Naming each
-    question explicitly removes the ambiguity entirely.
+    This is the one thing a batch gets that a single call does not, and the only
+    reason the batches run in sequence rather than at once: a batch that can see
+    what has already been asked can avoid restating it.
+
+    Grouped by type and carrying only the stem plus the labels a later batch can
+    act on. The options, reasoning and rationale are deliberately left out — they
+    would multiply the prompt several times over without telling it anything a
+    duplicate check needs.
     """
-    lines = []
-    for qtype, levels in blooms_by_type.items():
-        label = _TYPE_LABELS.get(qtype, qtype)
-        assignments = "   ".join(
-            f"Q{i}: {level}" for i, level in enumerate(levels, start=1)
-        )
-        lines.append(f"     {label} — generate EXACTLY {len(levels)}:\n       {assignments}")
+    if not digest:
+        return ""
+
+    grouped: Dict[str, List[Dict[str, str]]] = {}
+    for entry in digest:
+        grouped.setdefault(entry.get("type", ""), []).append(entry)
+
+    lines: List[str] = []
+    number = 0
+    for type_key in [t for t in _TYPE_LABELS if t in grouped] + [
+        t for t in grouped if t not in _TYPE_LABELS
+    ]:
+        lines.append(f"  {_TYPE_LABELS.get(type_key, type_key)}")
+        for entry in grouped[type_key]:
+            number += 1
+            tags = [t for t in (entry.get("blooms_level"), entry.get("course_name")) if t]
+            tag_str = f"[{' · '.join(tags)}] " if tags else ""
+            lines.append(f"   {number:>3}. {tag_str}{entry['stem']}")
+
     return (
-        "Per-question Bloom's assignment for THIS PART (NON-NEGOTIABLE):\n"
-        "     Each question number below is numbered within its own type, for this\n"
-        "     part only. Write the question content to genuinely reflect the level\n"
-        "     assigned to it and set `blooms_level` to exactly that level.\n"
+        "  ------------------------------------------------------------\n"
+        "  ALREADY GENERATED IN EARLIER PARTS — DO NOT REPEAT\n"
+        "  ------------------------------------------------------------\n"
+        f"  The following {number} question(s) have already been generated for this\n"
+        "  assessment. They are NOT part of your count.\n\n"
         + "\n".join(lines)
+        + "\n\n"
+        "  - Every question you write MUST be distinct from all of the above in the\n"
+        "    CONCEPT it tests, not merely in wording. Duplicating, rephrasing, inverting, narrowing\n"
+        "    or changing the question type of an existing question is a duplicate.\n"
+        "  - A question is a duplicate if a person who knows the answer to one would\n"
+        "  have a meaningful advantage answering the other.\n"
+        "  - Same concept at a different Bloom's level = duplicate.\n"
+        "  - A genuinely broader or narrower knowledge domain at a different Bloom's\n"
+        "    level = permitted.\n\n"
+        "  - This does NOT change your counts. Produce exactly the counts in section 9\n"
+        "    AND exactly the per-course quantities in section 13.\n"
+        "  - The course tag on each line above is there so you can avoid repeating a\n"
+        "    concept — NOT as a signal that a course is 'done'. A course appearing\n"
+        "    often above still receives its full quantity in this part. If avoiding a\n"
+        "    duplicate is hard for a course you owe questions to, narrow the sub-topic\n"
+        "    or change the knowledge domain within that course; do NOT move the\n"
+        "    question to a course that looks less covered."
     )
 
 
-def build_course_distribution_instruction(course_weightage: Optional[Any] = None) -> str:
-    """
-    The per-course sourcing instruction, built from the weightage percentages.
+def parse_course_weightage(course_weightage: Optional[Any]) -> Optional[Dict[str, float]]:
+    """The weightage payload as a `{course_id: percentage}` dict, or None."""
+    if not course_weightage:
+        return None
+    try:
+        weights = (
+            json.loads(course_weightage)
+            if isinstance(course_weightage, str) else course_weightage
+        )
+        parsed = {
+            str(cid): float(weight)
+            for cid, weight in dict(weights).items()
+            if float(weight) > 0
+        }
+        return parsed or None
+    except Exception as e:
+        logger.warning(
+            f"Failed to parse course weightage '{course_weightage}' - falling back "
+            f"to equal distribution. Error: {e}"
+        )
+        return None
 
-    Shared by the single-call and batch prompts so both phrase the instruction
-    identically.
+
+def course_counts_from_weightage(
+    course_weightage: Optional[Any],
+    total_questions: int,
+) -> Optional[Dict[str, int]]:
     """
+    The weightage percentages as exact integer per-course counts for the whole
+    assessment. Returns None when no usable weightage was supplied.
+
+    Converted once, here, rather than per batch. Handing every batch the same
+    percentages means every batch rounds them independently — 60% of a 25-question
+    batch is 15, but eight of those is not 60% of 200 unless the arithmetic
+    happens to be clean, and the last batch is never full. Splitting exact counts
+    by largest remainder makes the parts sum to the whole by construction.
+    """
+    weights = parse_course_weightage(course_weightage)
+    if not weights:
+        return None
+    return apportion(total_questions, weights, list(weights))
+
+
+def build_course_distribution_instruction(
+    course_weightage: Optional[Any] = None,
+    course_counts: Optional[Dict[str, int]] = None,
+) -> str:
+    """
+    The per-course sourcing instruction.
+
+    `course_counts` is supplied only on the batched path: this batch's exact share
+    of each course, already apportioned. The single-call path passes nothing and
+    gets the percentage wording.
+
+    Still says nothing about which specific question types come from which course
+    — the cross product is left to the model. What it no longer leaves implicit is
+    that the quota has to be spread across the types rather than parked in one of
+    them; that rule lives in section 13 of the template, which observed runs
+    showed was being treated as advisory next to the per-type counts.
+    """
+    if course_counts:
+        lines = [f"  - {cid}: EXACTLY {count} question(s)" for cid, count in course_counts.items()]
+        return (
+            "Draw the questions in THIS PART from each course in these EXACT "
+            "quantities. Each key is a course identifier from input 2 — resolve it "
+            "to that course's `name` and put that exact string in `course_name`:\n"
+            + "\n".join(lines)
+            + "\n"
+            "These quantities are for THIS PART ONLY and already account for the "
+            "parts before it. They are not a target to approximate: the count of "
+            "questions bearing each course name must match the number above exactly."
+        )
+
+    # Unchanged from the single-call path, down to the wording and the
+    # fall-through on a malformed payload.
     if course_weightage:
         try:
             weights_dict = json.loads(course_weightage) if isinstance(course_weightage, str) else course_weightage
-            instruction_list = [f"{cid}: {weight}%" for cid, weight in weights_dict.items()]
-            return "Distribute the generated questions STRICTLY according to the following percentages:\n" + "\n".join(instruction_list)
+            instruction_list = [f"  - {cid}: EXACTLY {weight}% of the total" for cid, weight in weights_dict.items()]
+            return (
+                "Distribute the generated questions STRICTLY according to the "
+                "following percentages. Each key is a course identifier from input 2 "
+                "— resolve it to that course's `name` and put that exact string in "
+                "`course_name`:\n"
+                + "\n".join(instruction_list)
+                + "\n"
+                "Convert each percentage against the total question count and hold "
+                "to the resulting whole numbers."
+            )
         except Exception as e:
             logger.warning(f"Failed to parse course weightage '{course_weightage}' - falling back to equal distribution. Error: {e}")
 
@@ -589,136 +683,167 @@ async def generate_assessment(
         # ---- Batched path ----
         result_json, usage = await _generate_in_batches(
             question_type_counts=question_type_counts,
+            requested_total=requested_total,
             blooms_by_type=blooms_by_type,
             blooms_str=blooms_str,
             course_weightage=course_weightage,
             shared_prompt_inputs=shared_prompt_inputs,
             aggregated_metadata=aggregated_metadata,
-            learning_objectives=list(dict.fromkeys(combined_learning_objectives)),
-            competency_area=competency_area,
-            topic_names=topic_names,
             time_limit=time_limit,
-            enable_blooms=enable_blooms,
             job_id=composite_id,
         )
 
     return aggregated_metadata, result_json, usage
 
-
 async def _generate_in_batches(
     *,
     question_type_counts: Dict[str, int],
+    requested_total: int,
     blooms_by_type: Dict[str, List[str]],
     blooms_str: str,
     course_weightage: Optional[Any],
     shared_prompt_inputs: Dict[str, Any],
     aggregated_metadata: Dict[str, Any],
-    learning_objectives: List[str],
-    competency_area: Optional[str],
-    topic_names: Optional[List[str]],
     time_limit: Optional[int],
-    enable_blooms: bool,
     job_id: Optional[str],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Generate a large assessment as several parallel calls and merge the results.
+    Generate a large assessment as several calls made ONE AFTER ANOTHER.
 
-    Every batch receives the same inputs a single call would, the full KCM
-    dataset included, so no batch is constrained more tightly than the
-    single-call path is.
+    Every batch renders the same `system_prompt_template` a single call renders,
+    with the same course context, transcripts, KCM dataset, governance rules and
+    item-writing standards. What differs is only what goes into the placeholders
+    that already exist: this batch's question counts, its slice of the Bloom's
+    assignment, its share of the course counts — and one block appended at the
+    end listing the questions the earlier batches already produced.
 
-    The blueprint is the one exception: it is not generated by the model here —
-    no single batch sees the whole assessment, and independently written
-    blueprints cannot be merged. It is assembled in `blueprint.py` from the
-    request, the course metadata and the questions that were actually produced.
+    That list is the reason the calls are sequential. It is also why none of the
+    parallel design's defences against two blind batches colliding are needed.
+
+    The blueprint is authored by the LAST batch, the only call that has seen the
+    whole assessment. Its prompt and response schema are identical to a single
+    call's; the earlier batches have the blueprint section blanked and the key
+    dropped from their schema.
     """
-    assessment_type = shared_prompt_inputs.get("assessment_type")
-
-    batches = plan_batches(question_type_counts, blooms_by_type)
+    course_targets = course_counts_from_weightage(course_weightage, requested_total)
+    batches = plan_batches(question_type_counts, blooms_by_type, course_targets)
     if not batches:
         raise ValueError("No questions were requested — nothing to generate.")
 
     logger.info(
-        f"[{job_id}] Batched generation | {len(batches)} batches | "
-        f"{sum(b.total for b in batches)} questions"
+        f"[{job_id}] Sequential batched generation | {len(batches)} batches | "
+        f"{requested_total} questions"
+        + (f" | course targets {course_targets}" if course_targets else "")
     )
     for batch in batches:
-        logger.info(f"[{job_id}] {batch.describe()}")
+        logger.info(
+            f"[{job_id}] {batch.describe()}"
+            + (f" | courses {batch.course_counts}" if batch.course_counts else "")
+        )
 
-    # return_exceptions=True is deliberate: the default would surface the first
-    # failure while the remaining batches kept running unattended, burning tokens
-    # for results nobody collects. Waiting for all of them and then failing keeps
-    # the semantics clean.
-    results = await asyncio.gather(
-        *(
-            _generate_question_batch(
-                batch=batch,
-                blooms_str=blooms_str,
-                course_weightage=course_weightage,
-                shared_prompt_inputs=shared_prompt_inputs,
-                job_id=job_id,
-            )
-            for batch in batches
-        ),
-        return_exceptions=True,
+    digest: List[Dict[str, str]] = []
+    payloads: List[Any] = []
+    usages: List[Any] = []
+
+    # Section 10 asks the model to set question depth against the time available.
+    # The limit is the whole assessment's but a batch holds a slice, so left as-is
+    # a 25-question batch divides the whole budget by its own volume and reads a
+    # per-question allowance several times larger than the real one.
+    batch_prompt_inputs = dict(shared_prompt_inputs)
+    batch_prompt_inputs["time_to_complete"] = _format_batch_time_limit(
+        shared_prompt_inputs.get("time_to_complete"), requested_total,
     )
 
-    failures = [
-        (batches[i], outcome)
-        for i, outcome in enumerate(results)
-        if isinstance(outcome, BaseException)
-    ]
-    if failures:
-        detail = "; ".join(f"{b.describe()}: {exc}" for b, exc in failures)
-        logger.error(
-            f"[{job_id}] {len(failures)} of {len(batches)} batches failed | {detail}"
+    for batch in batches:
+        prompt = build_prompt(
+            question_type_counts=batch.type_counts,
+            total_questions=batch.total,
+            blooms_distribution=(
+                format_blooms_by_type(batch.blooms_by_type)
+                if batch.blooms_by_type else blooms_str
+            ),
+            course_weightage_instruction=build_course_distribution_instruction(
+                course_weightage, batch.course_counts or None,
+            ),
+            total_questions_text=(
+                _format_final_batch_total(batch, requested_total, question_type_counts)
+                if batch.is_final else None
+            ),
+            blueprint_section=None if batch.is_final else "",
+            output_format_section=(
+                None if batch.is_final
+                else ASSESSMENT_PROMPTS.get("output_format_section_batch", "")
+            ),
+            previously_generated=format_previously_generated(digest),
+            **batch_prompt_inputs,
         )
-        raise RuntimeError(
-            f"{len(failures)} of {len(batches)} question batches failed: {detail}"
+        schema = ASSESSMENT_SCHEMA if batch.is_final else schema_without_blueprint()
+
+        try:
+            payload, usage = await _generate_question_batch(
+                prompt=prompt, schema=schema, batch=batch, job_id=job_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — already retried inside
+            # Stop rather than skip ahead. A later batch is written against the
+            # list of what came before, so generating past a hole gives every
+            # remaining call an incomplete picture — and each one costs minutes
+            # on a job already known to come up short.
+            logger.error(
+                f"[{job_id}] {batch.describe()} failed after retries — keeping the "
+                f"{len(payloads)} batch(es) already generated | {exc}"
+            )
+            break
+
+        payloads.append(payload)
+        usages.append(usage)
+        digest.extend(summarize_for_dedup(payload))
+        logger.info(
+            f"[{job_id}] {batch.describe()} complete | "
+            f"{len(digest)}/{requested_total} questions so far"
         )
 
-    payloads = [outcome for outcome, _ in results]
-    usages = [usage for _, usage in results]
+    if not payloads:
+        raise RuntimeError(f"Every question batch failed for job {job_id}")
 
     merged_questions = merge_batches(payloads)
 
     produced = sum(len(v) for v in merged_questions.values())
-    requested = sum(b.total for b in batches)
-    if produced != requested:
-        # Every batch succeeded, so this means a batch returned fewer questions
-        # than it was told to. Surfaced rather than repaired — a corrective pass
-        # is a separate decision, and the counts are what the caller asked for.
-        #
-        # Named per type, because batches hold one type each wherever the plan
-        # allows it: a shortfall is now concentrated in whichever type the
-        # under-producing batch was writing, rather than spread thinly.
+    if produced != requested_total:
+        # Either a batch was abandoned above, or one returned fewer questions than
+        # it was told to. Surfaced rather than repaired — a corrective pass is a
+        # separate decision, and the counts are what the caller asked for.
         shortfall: Dict[str, int] = {}
         for type_key, bucket in BUCKET_BY_TYPE_KEY.items():
-            asked = sum(b.type_counts.get(type_key, 0) for b in batches)
+            asked = int((question_type_counts or {}).get(type_key) or 0)
             missing = asked - len(merged_questions.get(bucket, []))
             if asked and missing:
                 shortfall[type_key] = missing
         logger.warning(
             f"[{job_id}] Batched generation produced {produced} questions, "
-            f"{requested} were requested. Shortfall by type: "
+            f"{requested_total} were requested. Shortfall by type: "
             f"{shortfall or 'none — a batch returned an unrequested type'}"
         )
 
-    # Blueprint last (it counts what was generated) but placed first in the
-    # payload, so the stored shape matches what the single-call schema produces.
+    # The last batch to SUCCEED carries the blueprint. When the run was cut short
+    # that batch was not the final one and has none, so the blueprint is empty and
+    # `_recount_generated_fields` fills in what can be counted; exporters already
+    # fall back to "N/A" for the three fields they read.
+    last = payloads[-1] if isinstance(payloads[-1], dict) else {}
+    blueprint = last.get("blueprint") if isinstance(last.get("blueprint"), dict) else {}
+    if not blueprint:
+        logger.warning(
+            f"[{job_id}] No blueprint in the final batch response — the run was cut "
+            f"short, or the model omitted it. Emitting the counted fields only."
+        )
+
     assessment = {
-        "blueprint": blueprint_builder.build_blueprint(
+        "blueprint": _recount_generated_fields(
+            blueprint, merged_questions,
+            assessment_type=shared_prompt_inputs.get("assessment_type"),
+            difficulty_level=shared_prompt_inputs.get("difficulty_level"),
+            input_language=shared_prompt_inputs.get("input_language"),
             aggregated_metadata=aggregated_metadata,
-            assessment={"questions": merged_questions},
-            assessment_type=str(assessment_type),
-            difficulty_level=str(shared_prompt_inputs.get("difficulty_level")),
-            input_language=str(shared_prompt_inputs.get("input_language")),
-            question_type_counts=question_type_counts,
-            learning_objectives=learning_objectives,
-            topic_names=topic_names,
             time_limit=time_limit,
-            competency_area=competency_area,
-            enable_blooms=enable_blooms,
         ),
         "questions": merged_questions,
     }
@@ -731,12 +856,84 @@ async def _generate_in_batches(
     return assessment, usage
 
 
+def _format_batch_time_limit(
+    time_to_complete: Optional[str],
+    requested_total: int,
+) -> Optional[str]:
+    """
+    What `{time_to_complete}` renders to on the batched path.
+
+    A batch is given the WHOLE assessment's limit but holds only a slice of the
+    questions, so dividing one by the other yields a per-question budget several
+    times too generous — a 25-question batch told "120 minutes" reads 4.8 minutes
+    a question when a 200-question assessment actually allows 0.6, and writes
+    deeper questions than the pacing supports.
+
+    The derived figure is stated outright rather than left to be worked out,
+    because doing that division against the wrong denominator is the whole
+    failure mode. The single-call path passes nothing here and renders the plain
+    limit exactly as it always has.
+    """
+    if not time_to_complete:
+        return time_to_complete
+
+    per_question = ""
+    if requested_total > 0:
+        minutes = re.search(r"\d+(?:\.\d+)?", str(time_to_complete))
+        if minutes:
+            per_question = (
+                f" — approximately {float(minutes.group()) / requested_total:.2g} "
+                f"minute(s) per question"
+            )
+
+    return (
+        f"{time_to_complete} for the COMPLETE assessment of {requested_total} "
+        f"question(s){per_question}.\n"
+        f"     This is NOT the budget for this part alone. Pace question depth "
+        f"against the whole-assessment figure above."
+    )
+
+
+def _format_final_batch_total(
+    batch: Batch,
+    requested_total: int,
+    question_type_counts: Dict[str, int],
+) -> str:
+    """
+    What `{total_questions_x3}` renders to for the last batch.
+
+    That batch does two jobs: it writes its own slice, and it authors the
+    blueprint for the whole assessment. The blueprint needs the whole-assessment
+    total and per-type counts — for its Assessment Scope Summary, Question Type
+    Suitability and Time Appropriateness Validation fields — while the generation
+    instruction still has to be this batch's own counts. Both are stated here,
+    labelled, rather than adding a placeholder to the template.
+
+    The whole-assessment figures are written inline and NOT through
+    `format_question_type_instructions`: rendering them as a second bulleted list
+    in the same shape as the one directly above would put two sets of counts in
+    identical formatting inside section 9, which invites the model to generate
+    against the wrong one.
+    """
+    breakdown = "; ".join(
+        f"{int(count)} {_TYPE_LABELS.get(key, key)}"
+        for key, count in (question_type_counts or {}).items()
+        if int(count or 0) > 0
+    )
+    return (
+        f"{batch.total} for THIS PART — generate exactly the counts listed above, "
+        f"and nothing more.\n"
+        f"     FOR THE BLUEPRINT ONLY (do NOT generate against these): the whole "
+        f"assessment is {requested_total} question(s) — {breakdown}. Describe those "
+        f"totals in the blueprint; generate only THIS PART's counts."
+    )
+
+
 async def _generate_question_batch(
     *,
+    prompt: str,
+    schema: Dict[str, Any],
     batch: Batch,
-    blooms_str: str,
-    course_weightage: Optional[Any],
-    shared_prompt_inputs: Dict[str, Any],
     job_id: Optional[str],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
@@ -744,23 +941,15 @@ async def _generate_question_batch(
 
     A job is now several calls, so the chance of one failing is materially higher
     than with a single call — but equally, one bad response no longer has to lose
-    the whole assessment.
+    the whole assessment. `call_llm`'s own retry covers server, quota and cache
+    errors; this covers a response that arrived but cannot be used.
     """
-    prompt = build_batch_prompt(
-        batch=batch,
-        blooms_str=blooms_str,
-        course_weightage_instruction=build_course_distribution_instruction(course_weightage),
-        **shared_prompt_inputs,
-    )
-    schema = batch_questions_schema(list(batch.type_counts))
     attempts = max(1, BATCH_MAX_ATTEMPTS)
     last_error: Optional[Exception] = None
 
     for attempt in range(1, attempts + 1):
         try:
-            response_text, usage = await call_llm(
-                prompt, schema=schema, temperature=BATCH_TEMPERATURE,
-            )
+            response_text, usage = await call_llm(prompt, schema=schema)
             payload = json.loads(response_text)
             if not isinstance(payload, dict):
                 raise ValueError(f"Batch response was {type(payload).__name__}, expected an object")
@@ -778,68 +967,174 @@ async def _generate_question_batch(
 
     raise last_error if last_error else RuntimeError(f"{batch.describe()} failed")
 
-def build_batch_prompt(
+
+# `competency_area` on a question carries the KCM `Type`, which is spelled several
+# ways across the 109 entries ("Behavioural", "Behavioral", "Behavioural - Core")
+# and is absent on two. Normalised so grouping into the blueprint's
+# functional/behavioral/domain keys does not depend on the spelling.
+_BEHAVIOURAL_PREFIXES = ("behaviour", "behavior")
+_FUNCTIONAL_PREFIXES = ("functional",)
+
+
+def _competency_bucket(competency_area: Any) -> str:
+    kind = str(competency_area or "").strip().lower()
+    if kind.startswith(_BEHAVIOURAL_PREFIXES):
+        return "behavioral"
+    if kind.startswith(_FUNCTIONAL_PREFIXES):
+        return "functional"
+    return "domain"
+
+
+def _iter_questions(merged_questions: Dict[str, List[Dict[str, Any]]]):
+    for questions in (merged_questions or {}).values():
+        if not isinstance(questions, list):
+            continue
+        for question in questions:
+            if isinstance(question, dict):
+                yield question
+
+
+def _recount_generated_fields(
+    blueprint: Dict[str, Any],
+    merged_questions: Dict[str, List[Dict[str, Any]]],
     *,
-    batch: Batch,
-    blooms_str: str,
-    course_weightage_instruction: str,
-    course_context: str,
-    learning_objectives_str: str,
-    transcript: str,
-    pdf_snippets: str,
-    assessment_type: str,
-    difficulty_level: str,
-    time_to_complete: Optional[str],
-    additional_instructions: Optional[str],
-    input_language: str,
-    topic_names: str,
-    competency_focus_instruction: str = "Not applicable for this assessment type.",
-) -> str:
+    assessment_type: Optional[str] = None,
+    difficulty_level: Optional[str] = None,
+    input_language: Optional[str] = None,
+    aggregated_metadata: Optional[Dict[str, Any]] = None,
+    time_limit: Optional[int] = None,
+) -> Dict[str, Any]:
     """
-    Render one batch's prompt from `batch_prompt_template`.
+    Overwrite the blueprint fields the model cannot state correctly.
 
-    Counts and Bloom's levels are the batch's own. Everything else — including
-    the full KCM dataset — matches what the single-call template carries, so a
-    batch is constrained exactly as a single call is. The only omission is the
-    blueprint, which is assembled in `blueprint.py` instead.
+    The blueprint is written by the last batch, from the same section of the same
+    template a single call uses. Most of its fields are properties of the request
+    that the batch is told outright. Two groups are not:
+
+      * **Tallies over the generated questions** — `blooms_taxonomy_mapping`,
+        `difficulty_distribution`, `unified_competency_map`. No single call holds
+        every question: the last batch sees its own in full and the rest only as
+        stems. Counting them here is exact; asking a model to tally two hundred
+        items is not.
+
+      * **The assessment's size and pacing** — the question total in
+        `assessment_scope_summary`, and `time_appropriateness_validation`. Both
+        are arithmetic over values already known here, and the batch authoring
+        them has only ever generated its own slice — in practice it reports that
+        slice's count and pacing rather than the whole request's.
+
+    Everything else is left exactly as the model wrote it. A tallied field is
+    only replaced when there is something to replace it with, so a payload
+    carrying none of the underlying data keeps the model's version.
     """
-    prompt_template = ASSESSMENT_PROMPTS.get('batch_prompt_template', '')
-    if not prompt_template:
-        raise RuntimeError("batch_prompt_template is missing from resources/prompts.yaml")
-
-    if not batch.type_counts:
-        raise ValueError("A batch must request at least one question type.")
-
-    # Bloom's: only the per-question form when this batch actually holds an
-    # assignment. When Bloom's is disabled, or the caller supplied no explicit
-    # distribution (so only percentages exist), the shared string already says
-    # the right thing and applies unchanged to every batch.
-    blooms_instruction = (
-        format_batch_blooms(batch.blooms_by_type) if batch.blooms_by_type else blooms_str
+    out = dict(blueprint or {})
+    produced = sum(
+        len(v) for v in (merged_questions or {}).values() if isinstance(v, list)
     )
 
-    prompt = prompt_template.replace("{course_context}", course_context)
-    prompt = prompt.replace("{learning_objectives_str}", learning_objectives_str)
-    prompt = prompt.replace("{content_context}", f"TRANSCRIPTS:\n{transcript}\n\nPDF CONTENT:\n{pdf_snippets}")
-    prompt = prompt.replace("{additional_instructions}", additional_instructions or "None provided")
-    prompt = prompt.replace("{input_language}", input_language or "English")
-    prompt = prompt.replace("{kcm_dataset}", json.dumps(KCM_DATASET, indent=2))
-
-    prompt = prompt.replace("{assessment_type}", assessment_type or "comprehensive")
-    prompt = prompt.replace("{difficulty_level}", difficulty_level or "Medium")
-    prompt = prompt.replace("{batch_total}", str(batch.total))
-    prompt = prompt.replace("{time_to_complete}", time_to_complete or "Not provided (use standard pacing)")
-    prompt = prompt.replace("{course_weightage_instruction}", course_weightage_instruction)
-    prompt = prompt.replace("{competency_focus_instruction}", competency_focus_instruction)
-
-    prompt = prompt.replace(
-        "{question_type_instructions}",
-        format_question_type_instructions(batch.type_counts),
+    # --- size and pacing: computed, never authored ---
+    courses: List[str] = []
+    for course in (aggregated_metadata or {}).get("courses", []) or []:
+        name = str((course or {}).get("name") or "").strip() if isinstance(course, dict) else ""
+        if name and name not in courses:
+            courses.append(name)
+    out["assessment_scope_summary"] = (
+        f"{str(assessment_type or 'Assessment').capitalize()} assessment of "
+        f"{produced} question(s) at {difficulty_level} difficulty, authored in "
+        f"{input_language}, drawn from "
+        f"{', '.join(courses) if courses else 'user-provided content'}."
     )
-    prompt = prompt.replace("{topic_names}", topic_names)
-    prompt = prompt.replace("{blooms_distribution}", blooms_instruction)
 
-    return prompt
+    limit = int(time_limit) if time_limit else 0
+    if limit > 0 and produced > 0:
+        out["time_appropriateness_validation"] = (
+            f"{limit} minute(s) for {produced} question(s) is "
+            f"{round(limit / produced, 2)} minute(s) per question at "
+            f"{difficulty_level} difficulty."
+        )
+    else:
+        out["time_appropriateness_validation"] = (
+            f"No time limit was configured for this assessment ({produced} "
+            f"question(s), {difficulty_level} difficulty); standard pacing applies."
+        )
+
+    blooms: Counter = Counter()
+    difficulty: Counter = Counter()
+    competencies: Dict[str, List[str]] = {"functional": [], "behavioral": [], "domain": []}
+
+    for question in _iter_questions(merged_questions):
+        level = str(question.get("blooms_level") or "").strip()
+        if level:
+            blooms[level] += 1
+        difficulty_level = str(question.get("difficulty_level") or "").strip()
+        if difficulty_level:
+            difficulty[difficulty_level] += 1
+
+        reasoning = question.get("reasoning")
+        alignment = reasoning.get("competency_alignment") if isinstance(reasoning, dict) else None
+        kcm = alignment.get("kcm") if isinstance(alignment, dict) else None
+        if not isinstance(kcm, dict):
+            continue
+        sub_theme = str(kcm.get("competency_sub_theme") or "").strip()
+        if not sub_theme:
+            continue
+        theme = str(kcm.get("competency_theme") or "").strip()
+        rendered = f"{theme} > {sub_theme}" if theme else sub_theme
+        bucket = _competency_bucket(kcm.get("competency_area"))
+        if rendered not in competencies[bucket]:
+            competencies[bucket].append(rendered)
+
+    if blooms:
+        out["blooms_taxonomy_mapping"] = dict(blooms)
+    if difficulty:
+        out["difficulty_distribution"] = ", ".join(
+            f"{level}: {count}" for level, count in difficulty.items()
+        )
+    if any(competencies.values()):
+        out["unified_competency_map"] = competencies
+
+    return out
+
+
+# Token counters summed across a batched job. Anything else in a usage payload
+# (cache hit counts, modality breakdowns) is left to the first batch's value.
+_USAGE_TOKEN_FIELDS = (
+    "prompt_token_count",
+    "candidates_token_count",
+    "thoughts_token_count",
+    "cached_content_token_count",
+    "total_token_count",
+)
+
+
+def _merge_usage(usage_list: List[Optional[Dict[str, Any]]]) -> Dict[str, Any]:
+    """
+    Sum usage across batches into the shape a single call returns.
+
+    worker_service reads one dict for both the completion log and the
+    `token_usage` column, so keeping the shape identical means the worker needs
+    no changes — and without the summing a batched job would report only one
+    batch's tokens.
+    """
+    usable = [u for u in usage_list if isinstance(u, dict)]
+    if not usable:
+        return {}
+
+    merged: Dict[str, Any] = dict(usable[0])
+    for field in _USAGE_TOKEN_FIELDS:
+        total = 0
+        present = False
+        for usage in usable:
+            value = usage.get(field)
+            if isinstance(value, (int, float)):
+                total += value
+                present = True
+        if present:
+            merged[field] = int(total)
+
+    merged["batch_count"] = len(usable)
+    merged["per_batch_usage"] = usable
+    return merged
 
 
 def build_prompt(
@@ -858,11 +1153,50 @@ def build_prompt(
     blooms_distribution: str,
     course_weightage_instruction: str,
     competency_focus_instruction: str = "Not applicable for this assessment type.",
+    *,
+    total_questions_text: Optional[str] = None,
+    blueprint_section: Optional[str] = None,
+    output_format_section: Optional[str] = None,
+    previously_generated: str = "",
 ) -> str:
+    """
+    Render `system_prompt_template`.
+
+    The keyword-only arguments are what the batched path varies and the
+    single-call path never passes. Each defaults to the text that was previously
+    inline in the template, so a call that omits them renders the prompt
+    byte-for-byte as it did before those placeholders existed.
+
+      * `total_questions_text` — overrides "Total Questions = N". Used by the
+        final batch, which states its own count and the whole assessment's.
+      * `blueprint_section` — "" on every batch but the last, which is the only
+        one that authors a blueprint.
+      * `output_format_section` — the questions-only variant for those batches.
+      * `previously_generated` — the list of questions earlier batches produced.
+    """
     prompt_template = ASSESSMENT_PROMPTS.get('system_prompt_template', '')
-    
+
+    if blueprint_section is None:
+        blueprint_section = ASSESSMENT_PROMPTS.get('blueprint_section', '')
+    if output_format_section is None:
+        output_format_section = ASSESSMENT_PROMPTS.get('output_format_section', '')
+
+    # Sections are stored as YAML block scalars, which carry a trailing newline
+    # the template already supplies. An empty section takes its own blank line
+    # with it, so blanking one leaves no gap behind.
+    prompt = prompt_template
+    if blueprint_section.strip():
+        prompt = prompt.replace("{blueprint_section}", blueprint_section.rstrip("\n"))
+    else:
+        prompt = prompt.replace("{blueprint_section}\n\n", "")
+    prompt = prompt.replace("{output_format_section}", output_format_section.rstrip("\n"))
+    if previously_generated.strip():
+        prompt = prompt.replace("{previously_generated}", previously_generated.rstrip("\n"))
+    else:
+        prompt = prompt.replace("{previously_generated}\n", "")
+
     # Placeholder Replacement
-    prompt = prompt_template.replace("{course_context}", course_context)
+    prompt = prompt.replace("{course_context}", course_context)
     prompt = prompt.replace("{learning_objectives_str}", learning_objectives_str)
     prompt = prompt.replace("{content_context}", f"TRANSCRIPTS:\n{transcript}\n\nPDF CONTENT:\n{pdf_snippets}")
     prompt = prompt.replace("{additional_instructions}", additional_instructions or "None provided")
@@ -871,7 +1205,10 @@ def build_prompt(
     
     prompt = prompt.replace("{assessment_type}", assessment_type or "comprehensive")
     prompt = prompt.replace("{difficulty_level}", difficulty_level or "Medium")
-    prompt = prompt.replace("{total_questions_x3}", str(total_questions))
+    prompt = prompt.replace(
+        "{total_questions_x3}",
+        total_questions_text if total_questions_text is not None else str(total_questions),
+    )
     prompt = prompt.replace("{time_to_complete}", time_to_complete or "Not provided (use standard pacing)")
     prompt = prompt.replace("{course_weightage_instruction}", course_weightage_instruction)
     prompt = prompt.replace("{competency_focus_instruction}", competency_focus_instruction)
@@ -920,7 +1257,6 @@ async def call_llm(
     prompt: str,
     *,
     schema: Optional[Dict[str, Any]] = None,
-    temperature: float = 0.1,
 ) -> Tuple[str, Dict[str, Any]]:
     global _active_kcm_cache
     if not client:
@@ -932,10 +1268,11 @@ async def call_llm(
 
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
-        # Defaults to the full assessment schema so the single-call path behaves
-        # exactly as before; batches pass their own narrowed schema.
+        # Defaults to the full assessment schema, which is what the single-call
+        # path and the final batch both use. Only the earlier batches pass
+        # anything — the same schema with the `blueprint` key dropped.
         response_schema=schema if schema is not None else ASSESSMENT_SCHEMA,
-        temperature=temperature,
+        temperature=0.1,
     )
     if cache_name:
         config.cached_content = cache_name
@@ -943,12 +1280,11 @@ async def call_llm(
     contents = [types.Content(role="user", parts=[types.Part.from_text(text=prompt)])]
 
     try:
-        async with _llm_semaphore:
-            response = await client.aio.models.generate_content(
-                model=GENAI_MODEL_NAME,
-                contents=contents,
-                config=config
-            )
+        response = await client.aio.models.generate_content(
+            model=GENAI_MODEL_NAME,
+            contents=contents,
+            config=config
+        )
     except Exception as e:
         # Check if cache expired to trigger recreation on retry
         if "Cached content not found" in str(e) or "404" in str(e) or "invalid" in str(e).lower() or "cache" in str(e).lower():
@@ -965,46 +1301,6 @@ async def call_llm(
 
     return response.text, llm_usage
 
-
-# Token counters summed across a batched job. Anything else in a usage payload
-# (cache hit counts, modality breakdowns) is left to the first batch's value.
-_USAGE_TOKEN_FIELDS = (
-    "prompt_token_count",
-    "candidates_token_count",
-    "thoughts_token_count",
-    "cached_content_token_count",
-    "total_token_count",
-)
-
-
-def _merge_usage(usage_list: List[Optional[Dict[str, Any]]]) -> Dict[str, Any]:
-    """
-    Sum usage across batches into the shape a single call returns.
-
-    worker_service reads one dict for both the completion log and the
-    `token_usage` column, so keeping the shape identical means the worker needs
-    no changes — and without the summing a batched job would report only one
-    batch's tokens.
-    """
-    usable = [u for u in usage_list if isinstance(u, dict)]
-    if not usable:
-        return {}
-
-    merged: Dict[str, Any] = dict(usable[0])
-    for field in _USAGE_TOKEN_FIELDS:
-        total = 0
-        present = False
-        for usage in usable:
-            value = usage.get(field)
-            if isinstance(value, (int, float)):
-                total += value
-                present = True
-        if present:
-            merged[field] = int(total)
-
-    merged["batch_count"] = len(usable)
-    merged["per_batch_usage"] = usable
-    return merged
 
 async def extract_vtt_text(vtt_path: Path) -> str:
     def _read_and_clean():

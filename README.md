@@ -211,8 +211,7 @@ ai-assessment-service/
 │       ├── api.py                   ← FastAPI app (API process)
 │       ├── worker_service.py        ← Kafka consumer (Worker process)
 │       ├── generator.py             ← LLM prompt engineering & parsing
-│       ├── batching.py              ← Batch planning/merging for large assessments
-│       ├── blueprint.py             ← Assembles the assessment blueprint in Python (batched path)
+│       ├── batching.py              ← Sequential batch planning/merging for large assessments
 │       ├── questions.py             ← Editable question model: ids, ordering, provenance
 │       ├── validation.py            ← Validation gate + pre-update alerts
 │       ├── editing.py               ← Edit / add / delete / reorder operations + audit
@@ -277,17 +276,14 @@ The most complex file. Contains all prompt engineering logic.
 
 - Builds the full LLM prompt: system instructions + KCM context + course content + user config
 - Handles Bloom's taxonomy distribution across question types (proportional round-robin)
-- For assessments larger than `QUESTION_BATCH_SIZE`, branches into a batched path: plans and merges parallel calls via `batching.plan_batches`/`merge_batches`, and assembles the blueprint in Python via `blueprint.build_blueprint` (imported as `blueprint_builder`) instead of asking the model for it
+- For assessments larger than `QUESTION_BATCH_SIZE`, branches into a batched path: plans and merges **sequential** calls via `batching.plan_batches`/`merge_batches`. Each call renders the same `system_prompt_template` a single call does, with its own counts, its slice of the Bloom's assignment and its share of the course counts, plus a list of the questions earlier batches produced so it can avoid repeating them
 - Sends the prompt to Google Gemini via `client.aio.models.generate_content`
 - Parses the structured JSON response (real field/answer/mapping validation lives in `validation.py`, applied on the editing endpoints, not here)
 - Handles Gemini context caching for the KCM descriptions (~60k tokens)
 - Returns `(metadata, assessment_data, usage_stats)`
 
-#### `batching.py` — Batch planning and merging
-Splits an assessment bigger than `QUESTION_BATCH_SIZE` into several parallel LLM calls (batched along the question-type axis, not by course) and merges the results back into one payload, preserving Bloom's-level ordering across the split. Imported by `generator.py`.
-
-#### `blueprint.py` — Python-built assessment blueprint
-Assembles the assessment blueprint in Python for the batched generation path, since no single batched call sees the whole assessment and independently-written blueprints can't be merged. Imported by `generator.py` as `blueprint_builder`.
+#### `batching.py` — Sequential batch planning and merging
+Splits an assessment bigger than `QUESTION_BATCH_SIZE` into several LLM calls made one after another (batched along the question-type axis, not by course) and merges the results back into one payload. Divides the three whole-assessment properties — type counts, Bloom's levels and course counts — once, before the first call, so the parts sum to the whole by construction. `summarize_for_dedup` produces the compact list of already-generated questions each subsequent batch is shown. Imported by `generator.py`.
 
 #### `questions.py` — The editable question model
 The LLM returns questions grouped into type buckets with no single sequence. This module
@@ -451,13 +447,11 @@ Copy `.env.example` → `.env` and fill in values. **Never commit `.env`.**
 | `GOOGLE_LOCATION` | Worker | Vertex AI region (e.g. `us-central1`) |
 | `GENAI_MODEL_NAME` | Worker | Gemini model (e.g. `gemini-2.5-pro`) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Worker | Path to Vertex AI service account JSON |
-| `QUESTION_BATCH_SIZE` | Worker | Assessments larger than this go through the batched (parallel-call) generation path (default `25`) |
-| `LLM_MAX_CONCURRENCY` | Worker | Max in-flight LLM calls process-wide, to stay under Vertex quota (default `4`) |
-| `BATCH_MAX_ATTEMPTS` | Worker | Retry attempts per batch before the job fails (default `2`) |
+| `QUESTION_BATCH_SIZE` | Worker | Assessments larger than this go through the batched (sequential-call) generation path (default `25`) |
+| `BATCH_MAX_ATTEMPTS` | Worker | Retry attempts per batch before the run stops and keeps what succeeded (default `2`) |
+| `KAFKA_MAX_POLL_INTERVAL_MS` | Worker | How long one job may take before the broker assumes the consumer died and redelivers the message (default `3600000`) |
 | `ENABLE_QUESTION_BATCHING` | Worker | `false` forces every request down the original single-call path (default `true`) |
-| `BATCH_TEMPERATURE` | Worker | Sampling temperature for batch calls (default `0.1`, same as the single-call path) |
 | `NORMALIZE_OPTION_INDEX_BASE` | Worker | `false` disables the one-based→zero-based option index rebase on ingest (default `true`) |
-| `BATCH_SIZE_BY_TYPE` | Worker | Per-question-type override of `QUESTION_BATCH_SIZE` (code dict, not an env var; default: no override for any type) |
 | `MAX_QUESTIONS_PER_TYPE` | Worker | Per-question-type question limit (code dict, not an env var; default: no limit for any type; not currently enforced) |
 | `DOCUMENT_STORAGE_TYPE` | Both | `local` (default) or `gcs` |
 | `GCS_CREDENTIALS` | Both (GCS only) | Path to GCS service account JSON |

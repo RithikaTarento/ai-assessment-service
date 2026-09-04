@@ -84,7 +84,7 @@ sequenceDiagram
     end
 ```
 
-**Batching note**: the diagram shows one `Worker->>Gemini` call per job. For assessments whose requested question count exceeds `QUESTION_BATCH_SIZE` (default 25), the Worker instead fans out into several parallel Gemini calls that are merged before `status=COMPLETED` is written — see [4.7 Batched Generation](#47-batched-generation-for-large-assessments).
+**Batching note**: the diagram shows one `Worker->>Gemini` call per job. For assessments whose requested question count exceeds `QUESTION_BATCH_SIZE` (default 25), the Worker instead makes several Gemini calls one after another, merged before `status=COMPLETED` is written — see [4.7 Batched Generation](#47-batched-generation-for-large-assessments).
 
 ---
 
@@ -180,9 +180,9 @@ The 109 KCM competency definitions (~60k tokens) are uploaded to Gemini's contex
 
 ### 4.7 Batched Generation for Large Assessments
 
-When the requested per-type question counts sum to more than `QUESTION_BATCH_SIZE` (default 25, see `config.py`), `generator.py` does not make a single LLM call. `_generate_in_batches` uses `batching.py` to split the request into several batches along the question-type axis — every batch still receives the full course content and the full KCM framework — and runs them as parallel Gemini calls via `asyncio.gather`. The batches' question payloads are then combined into one assessment with `batching.merge_batches`.
+When the requested per-type question counts sum to more than `QUESTION_BATCH_SIZE` (default 25, see `config.py`), `generator.py` does not make a single LLM call. `_generate_in_batches` uses `batching.py` to split the request into several batches along the question-type axis — every batch still receives the full course content and the full KCM framework — and runs them **sequentially**, each one shown a compact list of the questions the earlier batches already produced so it can avoid restating them. The batches' question payloads are then combined into one assessment with `batching.merge_batches`.
 
-On this path the `blueprint` is not written by the LLM at all: no single batch sees the whole assessment, so independently-written blueprints could not be merged. Instead `blueprint.py` assembles the blueprint deterministically in Python from the request, the course metadata, and the questions the batches actually produced (e.g. `blooms_taxonomy_mapping` and `difficulty_distribution` are counted off the merged questions rather than authored by the model).
+The `blueprint` is authored by the **last** batch, which is the only call that has seen the whole assessment. That batch's prompt and response schema are identical to a single call's; the earlier batches have the blueprint section blanked and the key dropped from their schema. Afterwards `generator._recount_generated_fields` overwrites the three blueprint fields that can only be known by reading every generated question — `blooms_taxonomy_mapping`, `difficulty_distribution` and `unified_competency_map` — because those are tallies, and a model asked to count two hundred questions will not get them right.
 
 ### 4.8 Editing, Validation & Telemetry Modules
 
@@ -194,8 +194,7 @@ Beyond `generator.py`, the question-editing workspace is implemented across seve
 | `editing.py` | The editing operations (`apply_question_edit`, `apply_question_add`, `apply_question_delete`, `apply_question_reorder`, `diff_assessments`) as pure functions that return an updated assessment plus the audit/telemetry events the change produced. |
 | `validation.py` | The validation gate and pre-update alerts — `validate_question`/`validate_assessment` block saving an invalid question, and `build_change_alerts`/`build_delete_alerts` describe the impact of a pending edit or deletion. |
 | `telemetry.py` | The telemetry event registry — declares the full set of event codes, builds and emits events to the audit table and any registered sink, and distinguishes the audited events from the UI-reported and observability-only ones. |
-| `blueprint.py` | The deterministic blueprint builder used on the batched generation path (Section 4.7) — assembles the blueprint fields in Python from the request, course metadata and generated questions instead of asking the LLM for them. |
-| `batching.py` | Batch planning and merging for large assessments — `plan_batches` splits a request exceeding `QUESTION_BATCH_SIZE` into parallel per-question-type batches (preserving Bloom's level order), and `merge_batches` recombines the results into one payload. |
+| `batching.py` | Sequential batch planning and merging for large assessments — `plan_batches` splits a request exceeding `QUESTION_BATCH_SIZE` into per-question-type batches (dividing Bloom's levels and course counts so the parts sum to the whole), `summarize_for_dedup` builds the already-generated list each later batch is shown, and `merge_batches` recombines the results into one payload. |
 
 ---
 

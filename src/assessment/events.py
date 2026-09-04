@@ -90,6 +90,16 @@ async def send_request_event(payload: Dict[str, Any]):
 # Consumer Factory (For Worker)
 from aiokafka import AIOKafkaConsumer
 
+# Time the worker may spend on one message before the broker assumes it died.
+#
+# worker_service awaits process_job inline inside `async for msg in consumer`, so
+# this is really "how long may one assessment take". Sequential batching pushed
+# that from a few minutes to 15-30 for a large job, well past aiokafka's 5-minute
+# default — at which point the consumer is evicted mid-job, the offset is never
+# committed, and the message is redelivered to another worker that generates the
+# entire assessment a second time.
+KAFKA_MAX_POLL_INTERVAL_MS = int(os.getenv("KAFKA_MAX_POLL_INTERVAL_MS", "3600000"))
+
 def get_kafka_consumer():
     """Returns a consumer instance for the worker."""
     return AIOKafkaConsumer(
@@ -97,5 +107,6 @@ def get_kafka_consumer():
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         group_id=KAFKA_GROUP_ID,
         value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-        auto_offset_reset='earliest'
+        auto_offset_reset='earliest',
+        max_poll_interval_ms=KAFKA_MAX_POLL_INTERVAL_MS,
     )

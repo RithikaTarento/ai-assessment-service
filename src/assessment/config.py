@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-from typing import Dict, Optional
 from dotenv import load_dotenv
 
 # Robustly find the .env file relative to this file's location
@@ -45,33 +44,31 @@ GENAI_MODEL_NAME = os.getenv("GENAI_MODEL_NAME", "gemini-2.5-pro")
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 # ---------------------------------------------------------------------------
-# Batched question generation
+# Sequential batched question generation
 # ---------------------------------------------------------------------------
 # A single LLM call degrades once it is asked for a large number of questions at
 # once, so an assessment bigger than QUESTION_BATCH_SIZE is generated as several
-# parallel calls and merged. Requests at or under the batch size keep taking the
-# original single-call path unchanged.
+# calls made ONE AFTER ANOTHER and merged. Each call is shown the questions the
+# earlier ones produced, which is what lets it avoid restating them. Requests at
+# or under the batch size keep taking the original single-call path unchanged.
 #
 # Deliberately NO cap on the total question count anywhere — the frontend owns
 # that decision, as it did before batching existed.
 QUESTION_BATCH_SIZE = int(os.getenv("QUESTION_BATCH_SIZE", "25"))
 
-# In-flight LLM calls allowed process-wide. Batches run in parallel, so without
-# a bound, concurrent batches across concurrent jobs exhaust the Vertex quota.
-LLM_MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "4"))
-
-# Attempts per batch before the job is failed. One job is now several calls, so
-# a single bad response must not lose the whole assessment.
+# Attempts per batch before the run stops. One job is now several calls, so a
+# single bad response must not lose the whole assessment.
 BATCH_MAX_ATTEMPTS = int(os.getenv("BATCH_MAX_ATTEMPTS", "2"))
 
 # Escape hatch: forces every request down the original single-call path.
 ENABLE_QUESTION_BATCHING = os.getenv("ENABLE_QUESTION_BATCHING", "true").lower() == "true"
 
-# Sampling temperature for batch calls. Defaults to the same 0.1 the single-call
-# path uses, so behaviour is unchanged unless deliberately raised. Raising it is
-# the available knob for question diversity across parallel batches, which all
-# see identical content.
-BATCH_TEMPERATURE = float(os.getenv("BATCH_TEMPERATURE", "0.1"))
+# There is deliberately no concurrency bound and no separate batch temperature.
+# Both existed only because batches used to run in parallel: one to keep
+# simultaneous calls under the Vertex quota, the other as the only available
+# knob for diversity between batches that could not see each other. Sequential
+# generation makes exactly one call at a time, and the "already generated" list
+# does the job the temperature was standing in for.
 
 # Option indexes on MCQ / Multi-Choice questions are zero-based — the convention
 # resources/prompts.yaml states, resources/schemas.json documents and the UI
@@ -88,25 +85,6 @@ BATCH_TEMPERATURE = float(os.getenv("BATCH_TEMPERATURE", "0.1"))
 # client that has already read it. Set to "false" to store fresh LLM output with
 # whatever base it was generated on.
 NORMALIZE_OPTION_INDEX_BASE = os.getenv("NORMALIZE_OPTION_INDEX_BASE", "true").lower() == "true"
-
-# Per-question-type provisions. `None` means no limit; nothing enforces these
-# yet. BATCH_SIZE_BY_TYPE overrides QUESTION_BATCH_SIZE for one type — useful
-# because output volume per question differs sharply by type (an MTF with five
-# pairs plus full reasoning is several times a True/False).
-BATCH_SIZE_BY_TYPE: Dict[str, Optional[int]] = {
-    "mcq": None,
-    "ftb": None,
-    "mtf": None,
-    "multichoice": None,
-    "truefalse": None,
-}
-MAX_QUESTIONS_PER_TYPE: Dict[str, Optional[int]] = {
-    "mcq": None,
-    "ftb": None,
-    "mtf": None,
-    "multichoice": None,
-    "truefalse": None,
-}
 
 # Langfuse Observability (opt-in — set LANGFUSE_ENABLED=true to activate)
 LANGFUSE_ENABLED = os.getenv("LANGFUSE_ENABLED", "false").lower() == "true"
