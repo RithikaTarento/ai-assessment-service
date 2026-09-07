@@ -634,11 +634,11 @@ with tab_view:
                         )
                         new_text = st.text_area("Question text / matching context", key="add_text")
                         st.caption(
-                            "MCQ and Multi-Choice require exactly 4 options. "
+                            "MCQ and Multi-Choice require 2 to 5 options. "
                             "MTF requires at least 2 pairs (one per line as `left | right`)."
                         )
                         new_opts = st.text_area(
-                            "Options (one per line, exactly 4) — or MTF pairs as `left | right`",
+                            "Options (one per line, 2 to 5) — or MTF pairs as `left | right`",
                             key="add_opts",
                         )
                         new_correct = st.text_input(
@@ -893,7 +893,7 @@ with tab_view:
                             if bucket in ("Multiple Choice Question", "Multi-Choice Question"):
                                 options = q.get("options", [])
                                 st.caption(
-                                    f"Options — exactly 4 are required "
+                                    f"Options — at least 2 are required "
                                     f"(currently {len(options)}). "
                                     f"Add is {'enabled' if q.get('can_add_option') else 'disabled'}; "
                                     f"remove is {'enabled' if q.get('can_remove_option') else 'disabled'}."
@@ -927,7 +927,7 @@ with tab_view:
                                         value=oi, step=1, key=f"optord_{qkey}_{oi}",
                                         help="Zero-based index this option takes once "
                                              "saved — the same scale as the indexes above.")
-                                    # Remove is only permitted above 4 options.
+                                    # Remove is only permitted above the minimum.
                                     drop = ocol3.checkbox(
                                         "Remove", key=f"optdel_{qkey}_{oi}",
                                         disabled=not q.get("can_remove_option", False))
@@ -939,8 +939,8 @@ with tab_view:
                                                      # same way every time instead of
                                                      # being rejected.
                                                      "sort_key": (int(order), oi)})
-                                # Add is only permitted below 4 options. A new
-                                # option goes last; it can be moved on a later edit.
+                                # Add is only permitted below the bucket's ceiling. A
+                                # new option goes last; it can be moved on a later edit.
                                 if q.get("can_add_option"):
                                     extra = st.text_input(
                                         "New option text (leave blank to skip)",

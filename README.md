@@ -299,7 +299,7 @@ half-written assessment behind.
 
 Covers the five limbs the specification names — question, answer, option, mapping and assessment-level.
 
-- `validate_question()` — field-level rules. MCQ and Multi-Choice require **exactly 4 options**; the correct answer must reference a real option `index`; text, rationale, Bloom's level and relevance are all checked
+- `validate_question()` — field-level rules. MCQ and Multi-Choice require **at least 2 options**, and **at most 5 when the question is being added** (`is_new_question=True`; editing an existing question has no ceiling, so a generated question carrying more options stays editable); the correct answer must reference a real option `index`; text, rationale, Bloom's level and relevance are all checked
 - `validate_mapping()` — the competency triple is all-or-nothing, and mapping fields cannot be blanked. The KCM **vocabulary** check (against `resources/competencies.json`) runs only when a competency field is actually edited, because generated questions occasionally carry a label that is not an exact dataset match and a blanket check would make unrelated edits impossible on those questions
 - `validate_assessment()` — assessment-level invariants (at least one question, unique ids), plus per-question rules scoped to the questions a save actually touches, so a gap in an older question cannot block an unrelated edit
 - `EDITABLE_FIELDS` — the per-type allowlist of editable dotted paths. Server-owned fields (`question_id`, `question_type`, `provenance`) are never client-writable

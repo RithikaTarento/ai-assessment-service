@@ -418,7 +418,10 @@ def apply_question_add(
 
     data = normalize_assessment(data, in_place=True)
     _, _, stored = find_question(data, question["question_id"])
-    _raise_if_invalid(validate_question(bucket, stored, enable_blooms=enable_blooms))
+    # `is_new_question` turns on the option ceiling, which applies to a question
+    # being authored and not to later edits of it.
+    _raise_if_invalid(validate_question(
+        bucket, stored, enable_blooms=enable_blooms, is_new_question=True))
 
     events = [_event(
         telemetry.TEL_QUESTION_ADDED,

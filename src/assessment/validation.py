@@ -7,9 +7,11 @@ so a failed validation can never leave a half-written assessment behind.
 
 Field-level rules come from the source specification, with two clarifications
 applied:
-  * Answer-option counts follow the generation prompt rather than the 2..5
-    range: an MCQ has exactly 4 options, a Multi-Choice question has 4 or more.
-    See `MIN_OPTION_COUNT` / `MAX_OPTION_COUNT` in questions.py.
+  * Answer-option counts have a floor of two on every save, and a ceiling of
+    five that applies only to a question being added. The generation prompt still
+    asks for four, but that is a generation target, not a save-time constraint on
+    a human reviewer. See `MIN_OPTION_COUNT` / `MAX_OPTION_COUNT_ON_ADD` in
+    questions.py for why the ceiling is add-only.
   * An assessment must always contain at least one question.
 """
 
@@ -21,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .questions import (
     BLOOMS_LEVELS,
-    MAX_OPTION_COUNT,
+    MAX_OPTION_COUNT_ON_ADD,
     MIN_OPTION_COUNT,
     BUCKET_FTB,
     BUCKET_MCQ,
@@ -162,6 +164,7 @@ def validate_question(
     *,
     enable_blooms: bool = True,
     edited_paths: Optional[set] = None,
+    is_new_question: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Return every rule a single question violates. Empty list == valid.
@@ -170,6 +173,11 @@ def validate_question(
     mapping and (via `validate_assessment`) assessment-level validation.
     `edited_paths` scopes the vocabulary half of mapping validation — see
     `validate_mapping`.
+
+    `is_new_question` marks a question this save is *authoring* rather than
+    changing, which is the only case the option ceiling applies to — see
+    `MAX_OPTION_COUNT_ON_ADD` in questions.py. It defaults to False so an edit
+    path that knows nothing about the distinction gets the permissive rule.
     """
     qid = question.get("question_id")
     errors: List[Dict[str, Any]] = []
@@ -187,7 +195,8 @@ def validate_question(
 
     # --- options and answer key --------------------------------------
     if bucket in (BUCKET_MCQ, BUCKET_MULTICHOICE):
-        errors.extend(_validate_options(bucket, question, qid))
+        errors.extend(_validate_options(bucket, question, qid,
+                                        enforce_ceiling=is_new_question))
     elif bucket == BUCKET_FTB:
         if _is_blank(question.get("correct_answer")):
             errors.append(_err("correct_answer_required",
@@ -246,17 +255,19 @@ def validate_question(
 
 
 def _validate_options(bucket: str, question: Dict[str, Any],
-                      qid: Optional[str]) -> List[Dict[str, Any]]:
+                      qid: Optional[str], *,
+                      enforce_ceiling: bool = False) -> List[Dict[str, Any]]:
     errors: List[Dict[str, Any]] = []
     options = question.get("options")
 
     if not isinstance(options, list):
         return [_err("options_required", "Options must be a list.", "options", qid)]
 
-    # Option count follows the generation prompt: an MCQ has
-    # exactly 4 options, a Multi-Choice question has 4 or more.
+    # The floor always applies; the ceiling only when the question is being
+    # authored. `ceiling is None` therefore covers both a bucket with no ceiling
+    # at all and every edit of an existing question.
     count = len(options)
-    ceiling = MAX_OPTION_COUNT.get(bucket)
+    ceiling = MAX_OPTION_COUNT_ON_ADD.get(bucket) if enforce_ceiling else None
     if count < MIN_OPTION_COUNT or (ceiling is not None and count > ceiling):
         if ceiling is None:
             expected = f"at least {MIN_OPTION_COUNT}"
@@ -496,6 +507,7 @@ def validate_assessment(
     enable_blooms: bool = True,
     only_question_ids: Optional[set] = None,
     edited_paths_by_question: Optional[Dict[str, set]] = None,
+    new_question_ids: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
     """
     Validate the assessment-level invariants, plus the field-level rules for
@@ -505,6 +517,11 @@ def validate_assessment(
     `only_question_ids` restricts the per-question rules to the questions this
     save actually adds or changes. Assessment-level invariants — at least one
     question, unique identifiers — are always checked.
+
+    `new_question_ids` names the questions this save introduces, so the option
+    ceiling reaches a question added through the whole-blob path exactly as it
+    reaches one added through `POST /questions/create`. Questions the assessment
+    already held are validated without it.
 
     The restriction matters for existing data. `blooms_level`, for instance, was
     never a required field in resources/schemas.json, so an assessment generated
@@ -537,6 +554,7 @@ def validate_assessment(
         errors.extend(validate_question(
             bucket, question, enable_blooms=enable_blooms,
             edited_paths=(edited_paths_by_question or {}).get(qid),
+            is_new_question=qid in (new_question_ids or set()),
         ))
 
     return errors

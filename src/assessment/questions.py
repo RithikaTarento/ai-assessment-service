@@ -92,19 +92,30 @@ VALID_PROVENANCE = {PROV_AI_GENERATED, PROV_AI_ASSISTED, PROV_HUMAN_AUTHORED}
 
 BLOOMS_LEVELS = ["Remember", "Understand", "Apply", "Analyze", "Evaluate", "Create"]
 
-# Answer-option counts, taken from the generation prompt (resources/prompts.yaml):
-# MCQ is "4 options", MULTICHOICE is "4 or more options".
+# Answer-option counts. The floor and the ceiling have deliberately different
+# scopes.
 #
-# An earlier revision required exactly 4 for both, on the grounds that it
-# superseded the 2..5 range. That contradicted the prompt: a 5-option
-# Multi-Choice question is precisely what the LLM is asked to produce, so the
-# rule made those questions permanently uneditable — in assessments generated
-# after it shipped as much as in ones generated before.
-MIN_OPTION_COUNT = 4
-# Upper bound per bucket; None means unbounded.
-MAX_OPTION_COUNT: Dict[str, Optional[int]] = {
-    BUCKET_MCQ: 4,
-    BUCKET_MULTICHOICE: None,
+# The floor applies to every save. A question with fewer than two options is not
+# answerable, so it is rejected wherever it came from. This is looser than the
+# generation prompt (resources/prompts.yaml), which asks for "4 options" on an
+# MCQ and "4 or more" on a MULTICHOICE and is left untouched — the prompt is a
+# generation target, not a save-time rule, and enforcing its count made a
+# legitimate 2- or 3-option question impossible to save.
+MIN_OPTION_COUNT = 2
+
+# The ceiling applies only when a question is *authored* — `apply_question_add`,
+# and a question the whole-blob update introduces. Per bucket; None means no
+# ceiling even on add.
+#
+# Editing has no ceiling, and that asymmetry is the point. The MULTICHOICE prompt
+# sets no upper bound, so a generated question can legitimately carry six or more
+# options; a ceiling on the edit path would reject *every* save of such a
+# question — however unrelated the change — over an option count the reviewer
+# never chose, leaving it permanently uneditable. A question being authored from
+# scratch has no such history, so the ceiling is a fair constraint there.
+MAX_OPTION_COUNT_ON_ADD: Dict[str, Optional[int]] = {
+    BUCKET_MCQ: 5,
+    BUCKET_MULTICHOICE: 5,
 }
 
 # The types whose answer options are editable as options. These live
@@ -486,11 +497,11 @@ def ordered_questions(assessment_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         option_count = len(options) if isinstance(options, list) else None
         item["option_count"] = option_count
         if bucket in OPTION_BUCKETS and option_count is not None:
-            # The affordances mirror the count rules above: an MCQ is
-            # fixed at 4, while a Multi-Choice question can grow without limit
-            # and shrink back down to 4.
-            ceiling = MAX_OPTION_COUNT.get(bucket)
-            item["can_add_option"] = ceiling is None or option_count < ceiling
+            # These describe the *edit* path, which this projection feeds, so
+            # they mirror the floor only. `MAX_OPTION_COUNT_ON_ADD` is not
+            # consulted: it constrains authoring a new question, and reporting it
+            # here would disable a control the edit endpoint accepts.
+            item["can_add_option"] = True
             item["can_remove_option"] = option_count > MIN_OPTION_COUNT
         else:
             item["can_add_option"] = False

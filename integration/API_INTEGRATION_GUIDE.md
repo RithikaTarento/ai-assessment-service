@@ -326,7 +326,7 @@ curl --location 'https://portal.uat.karmayogibharat.net/apis/proxies/v8/ai/asses
 | `provenance` | `ai_generated` (untouched AI output), `ai_assisted` (AI output a reviewer has edited), `human_authored` (added manually). Server-controlled; ignored if sent by a client. |
 | `course_name` | The course this question is derived from. `"User Uploaded Content"` for standalone assessments. |
 | `question_text` | The question text (MTF uses `matching_context` instead) |
-| `options` | List of `{ "text": "...", "index": 0 }` answer choices. MCQ and Multi-Choice must have **exactly 4**. `index` is **zero-based** — the first option is `0`. |
+| `options` | List of `{ "text": "...", "index": 0 }` answer choices. MCQ and Multi-Choice must have **at least 2**, and **at most 5 when the question is being added**. `index` is **zero-based** — the first option is `0`. |
 | `correct_option_index` | For MCQ, the single `index` of the correct option. For Multi-Choice, an array of correct `index` values. **Zero-based**, and matched against each option's own `index` field, not its array position. |
 | `correct_answer` | FTB: the answer text. True/False: `"True"` or `"False"`. |
 | `pairs` | MTF: list of `{ "left": "...", "right": "..." }`, at least 2. |
@@ -409,11 +409,11 @@ A save is rejected outright if the resulting question would be invalid — nothi
 
 ```json
 {
-  "detail": "This question type must have exactly 4 options (found 3).",
+  "detail": "This question type must have at least 2 options (found 1).",
   "errors": [
     {
       "code": "option_count_invalid",
-      "message": "This question type must have exactly 4 options (found 3).",
+      "message": "This question type must have at least 2 options (found 1).",
       "field": "options",
       "question_id": "mcq_001"
     }
@@ -426,7 +426,7 @@ Validation covers the five limbs the specification names — question, answer, o
 | Limb | Rules |
 |---|---|
 | Question | Question text (or MTF matching context) cannot be empty. Answer rationale cannot be empty. `blooms_level` must be one of the six levels while Bloom's is enabled. `relevance_percentage` must be an integer 0–100. |
-| Option | MCQ and Multi-Choice must have **exactly 4 options**, each with non-empty text and a unique integer `index`. MTF requires at least 2 complete pairs. |
+| Option | MCQ and Multi-Choice must have **at least 2 options**, each with non-empty text and a unique integer `index`. A question being **added** must also have **at most 5** — editing an existing question has no ceiling, so a generated question carrying more options stays editable. MTF requires at least 2 complete pairs. |
 | Answer | The correct answer must reference an existing option `index`. MCQ takes one index, Multi-Choice at least one. True/False must be `"True"` or `"False"`. FTB requires answer text. A question can never be left unscorable. |
 | Mapping | A mapping field cannot be blanked once set. The competency triple is all-or-nothing — area, theme and sub-theme together. When the reviewer **edits** any competency field, the resulting triple must exist in the KCM dataset. |
 | Assessment | At least one question must remain. Question identifiers must be unique. |
@@ -519,11 +519,11 @@ Each question also carries affordance state, so the editor can disable controls 
 | Field | Meaning |
 |---|---|
 | `option_count` | Number of options, or `null` for types without options |
-| `can_add_option` | `true` only when an option-based question has fewer than 4 options. Add is disabled at 4. |
-| `can_remove_option` | `true` only when an option-based question has more than 4 options. Remove is disabled at 4. |
+| `can_add_option` | `true` for any option-based question. These flags describe the **edit** path, which has no option ceiling. |
+| `can_remove_option` | `true` only when an option-based question has more than 2 options. Remove is disabled at 2. |
 | `can_delete` | `false` when this is the only question in the assessment |
 
-Because MCQ and Multi-Choice must hold exactly 4 options, both option flags are normally `false`. They turn on only for a question that arrived with the wrong number — which is exactly when the reviewer needs to add or remove one to make it savable.
+`can_add_option` is always `true` on an option-based question, because the 5-option ceiling applies only to adding a question — not to editing one. `can_remove_option` turns off once a question is down to its last two options.
 
 ---
 
@@ -571,7 +571,7 @@ curl --location \
 |---|---|
 | `question_text` | All except MTF |
 | `matching_context` | MTF only |
-| `options` | MCQ, Multi-Choice — full replacement list, exactly 4 items of `{text, index}` |
+| `options` | MCQ, Multi-Choice — full replacement list, at least 2 items of `{text, index}` (no ceiling on edit) |
 | `correct_option_index` | MCQ (integer), Multi-Choice (array of integers) |
 | `correct_answer` | FTB (text), True/False (`"True"` / `"False"`) |
 | `pairs` | MTF — full replacement list of `{left, right}` |
@@ -1181,7 +1181,7 @@ Validation failures (400) on the editing endpoints add a machine-readable `error
 
 ```json
 {
-  "detail": "This question type must have exactly 4 options (found 3).",
+  "detail": "This question type must have at least 2 options (found 1).",
   "errors": [
     { "code": "option_count_invalid", "message": "...", "field": "options", "question_id": "mcq_001" }
   ]

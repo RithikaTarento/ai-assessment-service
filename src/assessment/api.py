@@ -1269,9 +1269,16 @@ async def update_assessment_v1(
             edited_paths_by_question.setdefault(e["question_id"], set()).update(
                 c["field"] for c in e["changed_fields"]
             )
+    # Questions this save introduces, so the option ceiling applies to them the
+    # same way it does on `POST /questions/create` — and to them only.
+    added = {
+        e["question_id"] for e in events
+        if e.get("question_id") and e["event_code"] == telemetry.TEL_QUESTION_ADDED
+    }
     errors = validate_assessment(
         normalized, enable_blooms=_blooms_enabled(row), only_question_ids=touched,
         edited_paths_by_question=edited_paths_by_question,
+        new_question_ids=added,
     )
     if errors:
         _emit_validation_failure(job_id, user_id, row, "bulk_update", errors)
