@@ -21,13 +21,12 @@ from .exporters import generate_pdf, generate_docx
 from .cleanup import start_cleanup_scheduler, stop_cleanup_scheduler
 from .events import stop_kafka_producer, send_request_event
 from .exporters_csv_v2 import generate_csv_v2, generate_csv_basic
-from .questions import normalize_assessment, ordered_questions, question_count
-from .validation import ValidationError, validate_assessment
+from .questions import normalize_assessment, question_count
+from .validation import ValidationError, validate_assessment, _err
 from .editing import (
     AUDIT_QUESTION_ADDED, AUDIT_QUESTION_EDIT_SAVED,
     EditResult, apply_question_add, apply_question_delete, apply_question_edit,
-    apply_question_reorder, diff_assessments, preview_question_delete,
-    preview_question_edit,
+    apply_question_reorder, diff_assessments,
 )
 
 # Configure Logging
@@ -491,11 +490,6 @@ class QuestionDeleteBody(_EnvelopeBody):
         description="Identifier of the question to delete. Required — it was a "
                     "path parameter before the gateway reshape.",
     )
-    confirm: Optional[Any] = Field(
-        None,
-        description="Must be `true`. Deletion requires explicit confirmation. "
-                    "Was a query parameter before the reshape.",
-    )
     version: Optional[int] = Field(
         None, description="Version this delete is based on."
     )
@@ -511,14 +505,10 @@ class QuestionReorderBody(_EnvelopeBody):
     question_order: Optional[List[str]] = Field(
         None, alias="questionOrder",
         description="The complete new sequence. Must list every question "
-                    "in the assessment exactly once.",
+                    "in the assessment exactly once. Required — a "
+                    "single-question move is expressed by sending the "
+                    "sequence it produces.",
     )
-    question_id: Optional[str] = Field(
-        None, alias="questionId",
-        description="Single-question move — used with `position`. This is "
-                    "the form a keyboard reorder produces.",
-    )
-    position: Optional[int] = Field(None, description="1-based target position.")
     version: Optional[int] = None
 
 
@@ -533,11 +523,7 @@ def _missing_request_response() -> JSONResponse:
     A body that is not the Sunbird envelope. 400 in the same shape as every
     other validation failure here, rather than Pydantic's 422.
     """
-    return _validation_response([{
-        "code": "request_required",
-        "field": "request",
-        "message": 'Request body must be the Sunbird envelope: {"request": {...}}.',
-    }])
+    return _validation_response([_err("request_required", "request")])
 
 
 def _question_id_errors(value: object) -> List[Dict]:
@@ -550,34 +536,60 @@ def _question_id_errors(value: object) -> List[Dict]:
     path. Only malformed input is a 400.
     """
     if value is None:
-        return [{"code": "question_id_required", "field": "questionId",
-                 "message": "questionId is required in the request body."}]
-    if not isinstance(value, str):
-        return [{"code": "question_id_invalid", "field": "questionId",
-                 "message": "questionId must be a string."}]
-    if not value.strip():
-        return [{"code": "question_id_invalid", "field": "questionId",
-                 "message": "questionId must not be blank."}]
+        return [_err("question_id_required", "questionId")]
+    if not isinstance(value, str) or not value.strip():
+        return [_err("question_id_invalid", "questionId")]
     return []
 
 
 def _validation_response(errors: List[Dict], status_code: int = 400) -> JSONResponse:
     """
-    A blocked save. `detail` stays a plain string so existing error
-    handling keeps working; `errors` carries the per-field detail.
+    A blocked save. `errors` carries the machine-readable per-field detail and
+    is what the client renders; `detail` stays a single short string so generic
+    error handling and log scraping keep working.
+
+    Neither carries a user-facing sentence. `detail` is the primary error's
+    `code`, not prose: the client owns the copy because it owns the user's
+    language, and this service serves twelve of them. See `validation._err`.
     """
-    first = errors[0]["message"] if errors else "Validation failed"
-    detail = first if len(errors) == 1 else f"{first} ({len(errors)} validation errors)"
+    first = errors[0].get("code", "validation_failed") if errors else "validation_failed"
+    detail = first if len(errors) <= 1 else f"{first} (+{len(errors) - 1} more)"
     return JSONResponse(status_code=status_code, content={"detail": detail, "errors": errors})
 
 
+class _ApiError(Exception):
+    """
+    A blocked request raised from a helper that cannot return a response —
+    `_load_for_edit` raises rather than returns, so it cannot build the
+    JSONResponse itself. The handler below renders it in the same code+params
+    shape as every other blocked write.
+    """
+
+    def __init__(self, status_code: int, errors: List[Dict]):
+        self.status_code = status_code
+        self.errors = errors
+
+
+@app.exception_handler(_ApiError)
+async def _api_error_handler(request, exc: _ApiError) -> JSONResponse:
+    return _validation_response(exc.errors, status_code=exc.status_code)
+
+
 def _conflict_response(job_id: str, current_version: Optional[int]) -> JSONResponse:
-    """Concurrent update detected. The save is blocked, not merged."""
+    """
+    Concurrent update detected. The save is blocked, not merged.
+
+    `detail` is the code, not a sentence, for the reason given in
+    `_validation_response`. `job_id` and `current_version` stay top-level
+    alongside the `errors` array: clients read `current_version` there to
+    resync, and both predate this shape.
+    """
     return JSONResponse(
         status_code=409,
         content={
-            "detail": "This assessment was changed by another update since you loaded it. "
-                      "Reload the assessment and re-apply your change.",
+            "detail": "version_conflict",
+            "errors": [_err("version_conflict", None,
+                            current_version=current_version)],
             "job_id": job_id,
             "current_version": current_version,
         },
@@ -609,22 +621,20 @@ def _owns(row: Dict, user_id: str) -> bool:
 async def _load_for_edit(job_id: str, user_id: str) -> Dict:
     """
     Fetch a completed, user-owned assessment ready for editing.
-    Raises HTTPException for the non-editable cases.
+
+    Raises `_ApiError` for the non-editable cases, so they reach the client in
+    the same code+params shape as a blocked write rather than as an English
+    `detail` sentence.
     """
     row = await get_assessment_status(job_id)
     if not row:
-        raise HTTPException(status_code=404, detail="Assessment not found")
+        raise _ApiError(404, [_err("assessment_not_found", "job_id")])
     if not _owns(row, user_id):
         logger.warning(f"[{job_id}] Edit denied — requester={user_id} | owner={row.get('user_id')}")
-        raise HTTPException(
-            status_code=403, detail="Access denied: you do not own this assessment"
-        )
+        raise _ApiError(403, [_err("assessment_access_denied", "job_id")])
     if row.get("status") != "COMPLETED":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Assessment is {row.get('status')} and cannot be edited until "
-                   f"generation completes.",
-        )
+        raise _ApiError(409, [_err("assessment_not_editable", "job_id",
+                                   status=row.get("status"))])
     return row
 
 
@@ -655,10 +665,7 @@ def _expected_version(row: Dict, body_version: Optional[int],
         try:
             claimed = int(if_match.strip().strip('"'))
         except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail="If-Match must be the integer assessment version, e.g. 'If-Match: 3'.",
-            )
+            raise _ApiError(400, [_err("if_match_invalid", "If-Match")])
     if claimed is not None and int(claimed) != stored:
         raise _Conflict(stored)
     return stored
@@ -682,7 +689,7 @@ async def _commit(
     Persist an editing result and its audit trail.
 
     Success is only reported after the database confirms the write, which is
-    what lets the client show "Saved successfully" truthfully.
+    what lets the client tell the user the save landed and be right.
 
     This is also what prevents duplicate saves. A double submission is
     two requests carrying the same expected version: the first commits and moves
@@ -712,38 +719,28 @@ async def _commit(
 
 
 def _saved_payload(job_id: str, version: int, data: Dict, result) -> Dict:
+    """
+    What a successful write returns: the new version and the resulting
+    sequence, so the client can reconcile its local state.
+
+    Deliberately carries no `alerts` and no `announcement`. Both described a
+    change the caller had just made, in English, for it to display — so both
+    belong to the client, which knows what it sent and what language to say it
+    in.
+
+    `code` is the outcome as a machine-readable token for the same reason a
+    blocked write returns one (see `_validation_response`): the client renders it
+    through its own string table. It replaces the `message` sentence these
+    endpoints returned while they were still unreleased. The legacy
+    `PUT /update/{job_id}` keeps its `message` — that one has shipped.
+    """
     return {
-        "message": "Saved successfully",
+        "code": "saved",
         "status": "COMPLETED",
         "job_id": job_id,
         "version": version,
         "question_order": data.get("question_order", []),
         "total_questions": question_count(data),
-        "alerts": result.alerts,
-        "announcement": result.announcement,
-    }
-
-
-@api_v1_router.get(
-    "/questions/list/{job_id}",
-    summary="List questions in assessment order",
-)
-async def list_questions_v1(job_id: str, user_id: str = Depends(get_current_user)):
-    """
-    The authoritative question sequence, flattened and position-annotated —
-    what the editing workspace renders.
-
-    Each item carries `position` (1-based), `question_bucket`,
-    `question_type_key` and `provenance` alongside the question's own fields.
-    """
-    row = await _load_for_edit(job_id, user_id)
-    data = normalize_assessment(row.get("assessment_data"))
-    return {
-        "job_id": job_id,
-        "version": int(row.get("version") or 1),
-        "total_questions": question_count(data),
-        "question_order": data.get("question_order", []),
-        "questions": ordered_questions(data),
     }
 
 
@@ -755,11 +752,6 @@ async def edit_question_v1(
     job_id: str,
     payload: QuestionEditRequest,
     user_id: str = Depends(get_current_user),
-    dry_run: bool = Query(
-        False,
-        description="Validate the edit and return the pre-update alerts without "
-                    "saving anything.",
-    ),
     if_match: Optional[str] = Header(None, alias="If-Match"),
 ):
     """
@@ -786,16 +778,6 @@ async def edit_question_v1(
     data = row.get("assessment_data") or {}
     enable_blooms = _blooms_enabled(row)
 
-    if dry_run:
-        preview = preview_question_edit(
-            data, question_id, body.updates,
-            editor_id=user_id, enable_blooms=enable_blooms,
-        )
-        preview["job_id"] = job_id
-        preview["version"] = int(row.get("version") or 1)
-        preview["dry_run"] = True
-        return preview
-
     try:
         expected = _expected_version(row, body.version, if_match)
     except _Conflict as conflict:
@@ -817,12 +799,11 @@ async def edit_question_v1(
 
     if not result.changed:
         return {
-            "message": "No changes to save",
+            "code": "no_changes",
             "status": "COMPLETED",
             "job_id": job_id,
             "version": int(row.get("version") or 1),
             "question": result.question,
-            "alerts": [],
         }
 
     try:
@@ -844,7 +825,6 @@ async def add_question_v1(
     job_id: str,
     payload: QuestionAddRequest,
     user_id: str = Depends(get_current_user),
-    dry_run: bool = Query(False, description="Validate without saving."),
     if_match: Optional[str] = Header(None, alias="If-Match"),
 ):
     """
@@ -875,13 +855,6 @@ async def add_question_v1(
                     f"errors={[e['code'] for e in exc.errors]}")
         return _validation_response(exc.errors)
 
-    if dry_run:
-        return {
-            "valid": True, "errors": [], "dry_run": True, "job_id": job_id,
-            "version": int(row.get("version") or 1),
-            "alerts": result.alerts, "question": result.question,
-        }
-
     try:
         version = await _commit(
             job_id, user_id, expected, result, operation="add_question",
@@ -897,26 +870,24 @@ async def add_question_v1(
 
 @api_v1_router.post(
     "/questions/delete/{job_id}",
-    summary="Delete a question, with confirmation",
+    summary="Delete a question",
 )
 async def delete_question_v1(
     job_id: str,
     payload: QuestionDeleteRequest,
     user_id: str = Depends(get_current_user),
-    dry_run: bool = Query(
-        False,
-        description="Return the confirmation content for this deletion without "
-                    "applying it.",
-    ),
     if_match: Optional[str] = Header(None, alias="If-Match"),
 ):
     """
-    Remove a question. Requires `confirm: true` in the body, and the last
-    remaining question cannot be deleted.
+    Remove a question. The last remaining question cannot be deleted.
 
-    This is a POST rather than a DELETE because `questionId` and the
-    confirmation flag now travel in the body, and a DELETE must not carry
-    one — intermediate proxies are free to drop it.
+    This is a POST rather than a DELETE because `questionId` travels in the
+    body, and a DELETE must not carry one — intermediate proxies are free to
+    drop it.
+
+    There is no `confirm` flag. Confirming a destructive action is a dialog,
+    and the dialog belongs to the client: a flag checked here stopped nothing,
+    because any caller that wanted the deletion simply set it.
     """
     if payload.request is None:
         return _missing_request_response()
@@ -927,33 +898,16 @@ async def delete_question_v1(
         return _validation_response(id_errors)
     question_id: str = body.question_id
 
-    if body.confirm is not None and not isinstance(body.confirm, bool):
-        return _validation_response([{
-            "code": "confirm_invalid", "field": "confirm",
-            "message": "confirm must be a boolean.",
-        }])
-    confirm = bool(body.confirm)
-    version = body.version
-
     row = await _load_for_edit(job_id, user_id)
     data = row.get("assessment_data") or {}
 
-    if dry_run:
-        preview = preview_question_delete(data, question_id)
-        preview["job_id"] = job_id
-        preview["version"] = int(row.get("version") or 1)
-        preview["dry_run"] = True
-        return preview
-
     try:
-        expected = _expected_version(row, version, if_match)
+        expected = _expected_version(row, body.version, if_match)
     except _Conflict as conflict:
         return _conflict_response(job_id, conflict.current_version)
 
     try:
-        result = apply_question_delete(
-            data, question_id, editor_id=user_id, confirmed=confirm
-        )
+        result = apply_question_delete(data, question_id, editor_id=user_id)
     except ValidationError as exc:
         codes = {e["code"] for e in exc.errors}
         if "question_not_found" in codes:
@@ -984,16 +938,23 @@ async def reorder_questions_v1(
     if_match: Optional[str] = Header(None, alias="If-Match"),
 ):
     """
-    Re-sequence the assessment, either by sending the complete new
-    `questionOrder`, or by moving one question with `questionId` + `position`
-    — the form a keyboard reorder produces.
+    Re-sequence the assessment by sending the complete new `questionOrder`.
 
-    `announcement` in the response is ready to place in an ARIA live region so
-    screen-reader users hear the result of the move.
+    It must be a permutation of the ids currently in the assessment — a partial
+    or padded list is rejected rather than partially applied, so a stale client
+    cannot drop questions by sending an out-of-date array. That check is why
+    this operation stays server-side, along with the persisted
+    `question_order` every export reads and the audit row per moved question.
+
+    A single-question move is expressed by sending the sequence it produces:
+    the client holds the whole array, so the move is a splice.
     """
     if payload.request is None:
         return _missing_request_response()
     body = payload.request
+
+    if body.question_order is None:
+        return _validation_response([_err("question_order_required", "questionOrder")])
 
     row = await _load_for_edit(job_id, user_id)
     data = row.get("assessment_data") or {}
@@ -1005,10 +966,7 @@ async def reorder_questions_v1(
 
     try:
         result = apply_question_reorder(
-            data, editor_id=user_id,
-            question_order=body.question_order,
-            question_id=body.question_id,
-            position=body.position,
+            data, editor_id=user_id, question_order=body.question_order,
         )
     except ValidationError as exc:
         logger.info(f"[{job_id}] Reorder blocked | "
@@ -1017,13 +975,11 @@ async def reorder_questions_v1(
 
     if not result.changed:
         return {
-            "message": "Question order unchanged",
+            "code": "order_unchanged",
             "status": "COMPLETED",
             "job_id": job_id,
             "version": int(row.get("version") or 1),
             "question_order": result.assessment_data.get("question_order", []),
-            "announcement": result.announcement,
-            "alerts": [],
         }
 
     try:
@@ -1055,11 +1011,9 @@ async def get_audit_trail_v1(
     """
     row = await get_assessment_status(job_id)
     if not row:
-        raise HTTPException(status_code=404, detail="Assessment not found")
+        raise _ApiError(404, [_err("assessment_not_found", "job_id")])
     if not _owns(row, user_id):
-        raise HTTPException(
-            status_code=403, detail="Access denied: you do not own this assessment"
-        )
+        raise _ApiError(403, [_err("assessment_access_denied", "job_id")])
 
     entries = await get_audit_trail(job_id, limit=limit, offset=offset)
     for entry in entries:

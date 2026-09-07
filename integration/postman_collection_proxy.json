@@ -182,81 +182,6 @@
       "response": []
     },
     {
-      "name": "List Questions in Order",
-      "request": {
-        "method": "GET",
-        "header": [
-          {
-            "key": "accept",
-            "value": "application/json"
-          },
-          {
-            "key": "cookie",
-            "value": "{{cookie}}"
-          }
-        ],
-        "url": {
-          "raw": "{{base_url}}/questions/list/{{job_id}}",
-          "host": [
-            "{{base_url}}"
-          ],
-          "path": [
-            "questions",
-            "list",
-            "{{job_id}}"
-          ]
-        }
-      },
-      "response": []
-    },
-    {
-      "name": "Edit Question (dry run — pre-update alert)",
-      "request": {
-        "method": "POST",
-        "header": [
-          {
-            "key": "accept",
-            "value": "application/json"
-          },
-          {
-            "key": "cookie",
-            "value": "{{cookie}}"
-          },
-          {
-            "key": "Content-Type",
-            "value": "application/json"
-          }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"request\": {\n    \"questionId\": \"{{question_id}}\",\n    \"version\": 1,\n    \"updates\": {\n      \"question_text\": \"Revised question text?\",\n      \"correct_option_index\": 2,\n      \"blooms_level\": \"Apply\",\n      \"relevance_percentage\": 88,\n      \"answer_rationale.correct_answer_explanation\": \"Option C is correct because ...\",\n      \"reasoning.learning_objective_alignment\": \"LO-3: Evaluate policy instruments\",\n      \"course_name\": \"Foundations of Public Policy\",\n      \"reasoning.competency_alignment.kcm.competency_area\": \"Behavioural\",\n      \"reasoning.competency_alignment.kcm.competency_theme\": \"Outcome Orientation\",\n      \"reasoning.competency_alignment.kcm.competency_sub_theme\": \"Accountability\"\n    }\n  }\n}",
-          "options": {
-            "raw": {
-              "language": "json"
-            }
-          }
-        },
-        "url": {
-          "raw": "{{base_url}}/questions/update/{{job_id}}?dry_run=true",
-          "host": [
-            "{{base_url}}"
-          ],
-          "path": [
-            "questions",
-            "update",
-            "{{job_id}}"
-          ],
-          "query": [
-            {
-              "key": "dry_run",
-              "value": "true"
-            }
-          ]
-        }
-      },
-      "response": []
-    },
-    {
       "name": "Edit Question",
       "request": {
         "method": "POST",
@@ -339,54 +264,7 @@
       "response": []
     },
     {
-      "name": "Delete Question (dry run — confirmation content)",
-      "request": {
-        "method": "POST",
-        "header": [
-          {
-            "key": "accept",
-            "value": "application/json"
-          },
-          {
-            "key": "cookie",
-            "value": "{{cookie}}"
-          },
-          {
-            "key": "Content-Type",
-            "value": "application/json"
-          }
-        ],
-        "url": {
-          "raw": "{{base_url}}/questions/delete/{{job_id}}?dry_run=true",
-          "host": [
-            "{{base_url}}"
-          ],
-          "path": [
-            "questions",
-            "delete",
-            "{{job_id}}"
-          ],
-          "query": [
-            {
-              "key": "dry_run",
-              "value": "true"
-            }
-          ]
-        },
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"request\": {\n    \"questionId\": \"{{question_id}}\"\n  }\n}",
-          "options": {
-            "raw": {
-              "language": "json"
-            }
-          }
-        }
-      },
-      "response": []
-    },
-    {
-      "name": "Delete Question (confirmed)",
+      "name": "Delete Question",
       "request": {
         "method": "POST",
         "header": [
@@ -416,7 +294,7 @@
         },
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"request\": {\n    \"questionId\": \"{{question_id}}\",\n    \"confirm\": true,\n    \"version\": 1\n  }\n}",
+          "raw": "{\n  \"request\": {\n    \"questionId\": \"{{question_id}}\",\n    \"version\": 1\n  }\n}",
           "options": {
             "raw": {
               "language": "json"
@@ -427,48 +305,7 @@
       "response": []
     },
     {
-      "name": "Reorder — move one question",
-      "request": {
-        "method": "POST",
-        "header": [
-          {
-            "key": "accept",
-            "value": "application/json"
-          },
-          {
-            "key": "cookie",
-            "value": "{{cookie}}"
-          },
-          {
-            "key": "Content-Type",
-            "value": "application/json"
-          }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"request\": {\n    \"questionId\": \"{{question_id}}\",\n    \"position\": 1,\n    \"version\": 1\n  }\n}",
-          "options": {
-            "raw": {
-              "language": "json"
-            }
-          }
-        },
-        "url": {
-          "raw": "{{base_url}}/questions/order/{{job_id}}",
-          "host": [
-            "{{base_url}}"
-          ],
-          "path": [
-            "questions",
-            "order",
-            "{{job_id}}"
-          ]
-        }
-      },
-      "response": []
-    },
-    {
-      "name": "Reorder — full sequence",
+      "name": "Reorder Questions",
       "request": {
         "method": "POST",
         "header": [

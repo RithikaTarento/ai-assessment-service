@@ -191,8 +191,8 @@ Beyond `generator.py`, the question-editing workspace is implemented across seve
 | Module | Responsibility |
 |---|---|
 | `questions.py` | Question-level model helpers — the five canonical question-type buckets, the `question_order` sequence, and `normalize_assessment()`, which backfills `question_id`, `provenance` and option indexes on every read and write. |
-| `editing.py` | The editing operations (`apply_question_edit`, `apply_question_add`, `apply_question_delete`, `apply_question_reorder`, `diff_assessments`) as pure functions that return an updated assessment plus the audit events the change produced. `AUDIT_EVENT_NAMES` declares the six kinds of change the audit trail records. |
-| `validation.py` | The validation gate and pre-update alerts — `validate_question`/`validate_assessment` block saving an invalid question, and `build_change_alerts`/`build_delete_alerts` describe the impact of a pending edit or deletion. |
+| `editing.py` | The editing operations (`apply_question_edit`, `apply_question_add`, `apply_question_delete`, `apply_question_reorder`, `diff_assessments`) as pure functions that return an updated assessment plus the audit events the change produced. `AUDIT_EVENT_CODES` declares the six kinds of change the audit trail records. |
+| `validation.py` | The validation gate — `validate_question`/`validate_assessment` block saving an invalid question. Errors are `code` + `field` + `question_id` + `params`, with no message string: the client owns the copy because it owns the user's language. `classify_option_change` tells an option re-sequencing from a real answer-key edit, and is here because the **audit trail** records that distinction. |
 | `batching.py` | Sequential batch planning and merging for large assessments — `plan_batches` splits a request exceeding `QUESTION_BATCH_SIZE` into per-question-type batches (dividing Bloom's levels and course counts so the parts sum to the whole), `summarize_for_dedup` builds the already-generated list each later batch is shown, and `merge_batches` recombines the results into one payload. |
 
 ---
@@ -341,8 +341,7 @@ nothing else about their activity is tracked.
 | `id` | `BIGSERIAL` PRIMARY KEY | Insertion order, which is also the chronological order |
 | `job_id` | `TEXT` | The assessment this change belongs to |
 | `assessment_version` | `INTEGER` | The version this change produced |
-| `event_code` | `TEXT` | The six audit feeds: Question Edit Saved · Question Added · Question Deleted · Question Reordered · Correct Answer Changed · Mapping Updated |
-| `event_name` | `TEXT` | Human-readable event name |
+| `event_code` | `TEXT` | The six audit feeds: `TEL-03` Question Edit Saved · `TEL-05` Question Added · `TEL-06` Question Deleted · `TEL-07` Question Reordered · `TEL-10` Correct Answer Changed · `TEL-11` Mapping Updated. Stored as the code alone — the display name is the client's to supply. |
 | `editor_id` | `TEXT` | The user who made the change |
 | `question_id` | `TEXT` | Affected question |
 | `question_type` | `TEXT` | `mcq` / `ftb` / `mtf` / `multichoice` / `truefalse` |
@@ -525,10 +524,9 @@ Note that `docker-compose.yml` builds **both** the `api` and `worker` services f
 |---|---|---|
 | `POST` | `/generate` | Enqueues job. Always returns 200 — `status` is `PENDING` (new), `IN_PROGRESS` (already running) or `COMPLETED` (cached/cloned, payload under `result`) |
 | `GET` | `/status/{job_id}` | Returns status + full result when COMPLETED |
-| `GET` | `/questions/list/{job_id}` | Questions in authoritative order, position-annotated |
 | `POST` | `/questions/create/{job_id}` | Add a human-authored question |
 | `POST` | `/questions/update/{job_id}` | Owner-only in-place edit of one question — `questionId` in body |
-| `POST` | `/questions/delete/{job_id}` | Delete a question — `questionId` + `confirm: true` in body |
+| `POST` | `/questions/delete/{job_id}` | Delete a question — `questionId` in body |
 | `POST` | `/questions/order/{job_id}` | Reorder questions — `questionOrder` array in body |
 | `GET` | `/audit/{job_id}` | Audit trail of all human changes |
 | `PUT` | `/update/{job_id}` | Owner-only whole-blob edit of assessment_data (legacy) |
@@ -536,6 +534,11 @@ Note that `docker-compose.yml` builds **both** the `api` and `worker` services f
 | `GET` | `/download/{job_id}?format=` | `csv` / `csv_basic` / `json` / `pdf` / `docx` — all built from the persisted final assessment |
 
 All editing endpoints validate before writing, bump `version`, and record audit rows.
+
+They persist and audit; they do not present. No endpoint returns impact warnings, a
+confirmation preview, screen-reader copy or an error sentence — those are client
+concerns, computable from the before-state the client already rendered. The API surface
+is correspondingly narrow: one input form per operation, and machine-readable output.
 
 ### Path shape and the gateway constraint
 
@@ -550,8 +553,7 @@ Consequences baked into the design:
 
 - The verb segment precedes `job_id`, so a job id can never be mistaken for a route name.
 - There is **no** bare `/questions` route — on a longest-prefix router it would shadow
-  `/questions/list`, `/questions/create`, `/questions/update`, `/questions/delete` and
-  `/questions/order`.
+  `/questions/create`, `/questions/update`, `/questions/delete` and `/questions/order`.
 - `PATCH`, `PUT` and `DELETE` all became `POST`, since the identifiers they used to carry
   in the path now travel in the body, and a `GET` or `DELETE` must not carry a body.
 - Request bodies use the Sunbird envelope `{"request": {...}}` with camelCase fields;
@@ -561,8 +563,7 @@ Validation of the relocated identifiers preserves the previous status codes: a m
 malformed `questionId` is a `400` in the service's usual `{"detail", "errors"}` shape,
 while a well-formed `questionId` naming no question stays a `404` (`question_not_found`),
 exactly as when it arrived in the path.
-`?dry_run=true` returns the validation result and impact alerts without saving. `409`
-means a concurrent update was detected and nothing was written.
+`409` means a concurrent update was detected and nothing was written.
 
 ### Key generate parameters
 

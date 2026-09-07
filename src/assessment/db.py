@@ -22,17 +22,22 @@ CREATE TABLE IF NOT EXISTS interactive_assessments (
 );
 """
 
-# Audit trail for every human change. One row per recorded change
-# (Question Edit Saved / Question Added / Question Deleted / Question Reordered),
-# written in the same transaction as the assessment update so an audit row
-# exists if and only if the change persisted.
+# Audit trail for every human change. One row per recorded change, written in
+# the same transaction as the assessment update so an audit row exists if and
+# only if the change persisted.
+#
+# `event_code` is the only identification of what happened. There is no display
+# name column: a label like "Question Edit Saved" is English copy, and the copy
+# belongs to the client — see `editing.AUDIT_EVENT_CODES`. Databases created
+# before this change still carry a nullable `event_name` column holding the
+# labels written back then; nothing reads or writes it any more, so it is left
+# in place rather than dropped, and rows written from now on leave it NULL.
 CREATE_AUDIT_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS interactive_assessment_audit (
     id BIGSERIAL PRIMARY KEY,
     job_id TEXT NOT NULL,
     assessment_version INTEGER NOT NULL,
-    event_code TEXT NOT NULL,          -- Question Edit Saved / Question Added / Question Deleted / Question Reordered
-    event_name TEXT,
+    event_code TEXT NOT NULL,          -- TEL-03 / TEL-05 / TEL-06 / TEL-07 / TEL-10 / TEL-11
     editor_id TEXT NOT NULL,           -- who made the change (attributability)
     question_id TEXT,
     question_type TEXT,
@@ -276,15 +281,14 @@ async def save_edited_assessment(
             for row in audit_rows or []:
                 await conn.execute("""
                     INSERT INTO interactive_assessment_audit
-                    (job_id, assessment_version, event_code, event_name, editor_id,
+                    (job_id, assessment_version, event_code, editor_id,
                      question_id, question_type, previous_position, new_position,
                      changed_fields, original_question, question_snapshot, details)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                 """,
                     job_id,
                     new_version,
                     row.get("event_code"),
-                    row.get("event_name"),
                     row.get("editor_id") or user_id,
                     row.get("question_id"),
                     row.get("question_type"),
@@ -305,7 +309,7 @@ async def get_audit_trail(
     """Change history for one assessment, oldest first."""
     async with get_pool().acquire() as conn:
         rows = await conn.fetch("""
-            SELECT id, job_id, assessment_version, event_code, event_name, editor_id,
+            SELECT id, job_id, assessment_version, event_code, editor_id,
                    question_id, question_type, previous_position, new_position,
                    changed_fields, original_question, question_snapshot, details, created_at
             FROM interactive_assessment_audit

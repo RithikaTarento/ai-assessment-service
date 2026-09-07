@@ -339,7 +339,13 @@ curl --location 'https://portal.uat.karmayogibharat.net/apis/proxies/v8/ai/asses
 
 ## Editing Workspace
 
-Endpoints 3–9 let a reviewer compose the final question set inside the platform. They share one set of rules.
+Endpoints 3–8 let a reviewer compose the final question set inside the platform. They share one set of rules.
+
+> **These endpoints persist and audit; they do not present.** They return no
+> user-facing sentences, no impact warnings and no screen-reader copy. Read
+> [What the client owns](#what-the-client-owns) before building against them —
+> several things a previous version of this API returned are now the client's
+> to produce.
 
 ### Path shape and request envelope
 
@@ -351,7 +357,6 @@ followed by `job_id` as the single trailing segment**:
 
 | Method | Path | Was |
 |---|---|---|
-| `GET` | `/questions/list/{job_id}` | `GET /assessments/{job_id}/questions` |
 | `POST` | `/questions/create/{job_id}` | `POST /assessments/{job_id}/questions` |
 | `POST` | `/questions/update/{job_id}` | `PATCH /assessments/{job_id}/questions/{question_id}` |
 | `POST` | `/questions/delete/{job_id}` | `DELETE /assessments/{job_id}/questions/{question_id}` |
@@ -363,10 +368,10 @@ Three things follow, and they matter for anyone writing a client:
 1. **`PATCH`, `PUT` and `DELETE` are all `POST` now.** The identifiers they used to carry
    in the path travel in the body instead, and a `GET` or `DELETE` must never carry a
    body — the semantics are undefined and intermediate proxies may drop it.
-2. **Every identifier except `job_id` is a body field**: `questionId`, `questionOrder`,
-   and the `confirm` flag on delete.
+2. **Every identifier except `job_id` is a body field**: `questionId` and
+   `questionOrder`.
 3. **There is no bare `/questions` route.** On a longest-prefix router it would shadow
-   all five verb routes above.
+   all four verb routes above.
 
 Request bodies use the Sunbird envelope:
 
@@ -379,46 +384,85 @@ camelCase (`questionId`, `questionOrder`, `questionType`, `eventCode`); the snak
 equivalents are accepted as aliases. **Responses are not enveloped** — they are unchanged
 from before the reshape.
 
-`dry_run`, `limit` and `offset` remain query parameters; a prefix-matching gateway passes
+`limit` and `offset` remain query parameters; a prefix-matching gateway passes
 the query string through untouched.
 
 ### Versioning and concurrent updates
 
 Every assessment carries an integer `version`, returned by `GET /status` and by every editing call. To make a change safely:
 
-1. Read the assessment (`GET /status/{job_id}` or `GET /questions/list/{job_id}`) and keep its `version`.
+1. Read the assessment (`GET /status/{job_id}`) and keep its `version`.
 2. Send that `version` back — in the request body, or as an `If-Match: <version>` header.
 3. If another update landed in between, the call returns **409** and **nothing is written**. Reload and re-apply.
 
 ```json
 {
-  "detail": "This assessment was changed by another update since you loaded it. Reload the assessment and re-apply your change.",
+  "detail": "version_conflict",
+  "errors": [
+    { "code": "version_conflict", "field": null, "question_id": null,
+      "params": { "current_version": 7 } }
+  ],
   "job_id": "...",
   "current_version": 7
 }
 ```
 
+`current_version` stays a top-level field as well as an error param, so a client can
+resync without reading the `errors` array.
+
 Omitting the version still protects against lost updates within a single request, but cannot detect that the user's screen was stale. **Always send it.**
 
-Sending the version is also what makes a **double submission** safe. Two requests carrying the same version cannot both apply: the first commits and moves the version on, the second matches nothing and returns 409. Even with no version supplied, a repeated identical request diffs to no changes and returns `"No changes to save"` without bumping the version. A double-clicked Save button can never apply the same edit twice.
+Sending the version is also what makes a **double submission** safe. Two requests carrying the same version cannot both apply: the first commits and moves the version on, the second matches nothing and returns 409. Even with no version supplied, a repeated identical request diffs to no changes and returns `"code": "no_changes"` without bumping the version. A double-clicked Save button can never apply the same edit twice.
 
 ### Validation
 
-A save is rejected outright if the resulting question would be invalid — nothing partial is ever stored. Validation failures return **400** with a machine-readable `errors` array alongside the human-readable `detail`:
+A save is rejected outright if the resulting question would be invalid — nothing partial is ever stored. Validation failures return **400** with a machine-readable `errors` array:
 
 ```json
 {
-  "detail": "This question type must have at least 2 options (found 1).",
+  "detail": "option_count_invalid",
   "errors": [
     {
       "code": "option_count_invalid",
-      "message": "This question type must have at least 2 options (found 1).",
       "field": "options",
-      "question_id": "mcq_001"
+      "question_id": "mcq_001",
+      "params": { "minimum": 2, "maximum": 5, "found": 1 }
     }
   ]
 }
 ```
+
+**Errors carry no message string.** Each is `code` + `field` + `question_id`, plus a
+`params` bag holding every value a message needs to interpolate. The client maps `code`
+to its own copy and fills in `params` — which is what lets one error render in any of the
+twelve languages this service generates assessments in. `detail` is the primary error's
+`code` (suffixed `(+N more)` when there are several), not a sentence: use it for logs and
+generic toasts, and `errors` for anything a user reads.
+
+So `{"code": "option_count_invalid", "params": {"minimum": 2, "maximum": 5, "found": 1}}`
+becomes "Needs between 2 and 5 options — this one has 1" in your string table.
+`maximum` is `null` when no ceiling applies, which is every edit of an existing question.
+
+`params` keys by code:
+
+| `code` | `params` |
+|---|---|
+| `option_count_invalid` | `minimum`, `maximum` (nullable), `found` |
+| `option_text_required`, `option_malformed`, `option_index_invalid` | `option_position` (1-based) |
+| `correct_option_index_out_of_range` | `found`, `valid_indexes` |
+| `correct_option_index_invalid`, `correct_option_index_required` | `expects` (`single_index` \| `index_array`) |
+| `correct_answer_invalid` | `allowed` |
+| `blooms_level_invalid` | `allowed`, `found` |
+| `relevance_invalid` | `minimum`, `maximum`, `found` |
+| `provenance_invalid` | `allowed`, `found` |
+| `pair_count_invalid` | `minimum`, `found` |
+| `pair_left_required`, `pair_right_required`, `pair_malformed` | `pair_position` (1-based) |
+| `competency_mapping_incomplete` | `missing` |
+| `field_not_editable` | `question_bucket`, `editable_fields` |
+| `question_type_invalid` | `found`, `expected` |
+| `question_order_invalid` | `missing`, `unknown`, `duplicated` |
+| `version_conflict` | `current_version` |
+| `assessment_not_editable` | `status` |
 
 Validation covers the five limbs the specification names — question, answer, option, mapping and assessment-level:
 
@@ -427,39 +471,86 @@ Validation covers the five limbs the specification names — question, answer, o
 | Question | Question text (or MTF matching context) cannot be empty. Answer rationale cannot be empty. `blooms_level` must be one of the six levels while Bloom's is enabled. `relevance_percentage` must be an integer 0–100. |
 | Option | MCQ and Multi-Choice must have **at least 2 options**, each with non-empty text and a unique integer `index`. A question being **added** must also have **at most 5** — editing an existing question has no ceiling, so a generated question carrying more options stays editable. MTF requires at least 2 complete pairs. |
 | Answer | The correct answer must reference an existing option `index`. MCQ takes one index, Multi-Choice at least one. True/False must be `"True"` or `"False"`. FTB requires answer text. A question can never be left unscorable. |
-| Mapping | A mapping field cannot be blanked once set. The competency triple is all-or-nothing — area, theme and sub-theme together. When the reviewer **edits** any competency field, the resulting triple must exist in the KCM dataset. |
+| Mapping | A mapping field cannot be blanked once set. The competency triple is all-or-nothing — area, theme and sub-theme together. The triple's values are free text and are not checked against the KCM dataset. |
 | Assessment | At least one question must remain. Question identifiers must be unique. |
 
-Two scoping rules keep validation from blocking unrelated work:
+A scoping rule keeps validation from blocking unrelated work:
 
 - Per-question rules apply to the questions a save **adds or changes**, not to untouched ones, so a gap in an older question cannot block an edit elsewhere.
-- The competency **vocabulary** check runs only when a competency field is actually edited. Generated questions occasionally carry a label that is not an exact match for the dataset; checking the vocabulary on every save would make a simple wording fix impossible on those questions.
 
 > **Edit the competency triple together.** Changing only `competency_theme` leaves the stored sub-theme belonging to the old theme, which fails validation. Send `competency_area`, `competency_theme` and `competency_sub_theme` in the same request.
 
-### Previewing a change (`dry_run`)
+### What the client owns
 
-`/questions/update`, `/questions/create` and `/questions/delete` accept `?dry_run=true`. The request is validated and its impact returned, but **nothing is saved** — this is what backs a pre-update confirmation dialog. Cancelling is purely client-side: discard local state and re-read the assessment.
+This API persists, validates and audits. It does not describe, warn or narrate. The
+following are **not** server concerns, and no endpoint returns them — build them in the
+client, where the before-state was rendered and the user's language is known.
 
-Dry-run is not identical across the three: `/questions/update` and `/questions/delete` skip the version-conflict check entirely for a preview, so they never fail on a stale `version`. `/questions/create` still checks the expected version before returning its preview, so a dry-run add **can** return a 409 version-conflict response if `version` is stale.
-
-`alerts` describes the impact of the pending change, each with a `severity` of `high`, `medium`, `low` or `info`:
-
-| `code` | Severity | Meaning |
+| Concern | Why it is yours | What you have to work with |
 |---|---|---|
-| `answer_key_changed` | high | The correct answer will change |
-| `options_changed` | high | The answer options will change |
-| `question_will_be_deleted` | high | The question will be permanently removed |
-| `last_question` | high | This is the only question and cannot be deleted |
-| `question_text_changed` | medium | Question text or matching context will change |
-| `competency_mapping_changed` | medium | Competency mapping will change |
-| `learning_outcome_changed` | medium | Learning outcome mapping will change |
-| `course_mapping_changed` | medium | Course mapping will change |
-| `blooms_level_changed` | low | Bloom's level will change |
-| `relevance_changed` | low | Relevance percentage will change |
-| `rationale_changed` | low | Answer rationale will change |
-| `provenance_will_change` | info | An AI-generated question will become AI-assisted |
-| `authoritative_version` | info | Saving replaces the version used for downloads and publication |
+| **Pre-save impact warnings** ("the correct answer will change") | A pure function of before/after. You rendered `before` and the user typed `after` — no round trip can tell you anything you don't already hold. | Your local before/after |
+| **Confirmation dialogs** | A dialog is UI. There is no `dry_run` and no `confirm` flag: a server-side confirmation gate stopped nothing, since any caller that wanted the write simply set it. | Your own modal |
+| **Telling an option *reorder* from an option *rewrite*** | Same-texts-different-order means the answer key moves without the answer changing. Warning "the correct answer will change" there is wrong, and it is the one thing a reviewer must be able to trust. Compare option text arrays before/after. | Your local before/after |
+| **Screen-reader announcements** | Presentation copy, and it must be in the user's language. Compose from the response. | `question_order`, `total_questions`, `version` |
+| **Error and alert wording** | See [Validation](#validation) — `code` + `params`, mapped to your string table. | `errors[]` |
+| **The flat, position-annotated question list** | Derivable from `GET /status` in a few lines. See [Building the editor list](#building-the-editor-list). | `assessment_data` |
+| **Per-question affordance state** (`can_delete`, `can_add_option`, …) | One-line predicates over the same data. See below. | `assessment_data` |
+
+Cancelling an edit is entirely local: discard your draft and re-render from the copy you
+already have. There is nothing to tell the server.
+
+### Building the editor list
+
+`GET /status/{job_id}` returns the whole assessment, so the editor's flat list is a
+client-side projection of it — walk `assessment_data.question_order`, look each id up in
+`assessment_data.questions`, and annotate:
+
+```js
+const BUCKET_KEY = {
+  "Multiple Choice Question": "mcq", "FTB Question": "ftb", "MTF Question": "mtf",
+  "Multi-Choice Question": "multichoice", "True/False Question": "truefalse",
+};
+const OPTION_BUCKETS = ["Multiple Choice Question", "Multi-Choice Question"];
+const MIN_OPTIONS = 2;
+
+function editorList(assessmentData) {
+  const { question_order: order, questions } = assessmentData;
+  const byId = new Map();
+  for (const [bucket, list] of Object.entries(questions ?? {})) {
+    for (const q of list ?? []) byId.set(q.question_id, { bucket, q });
+  }
+  const total = [...byId.keys()].length;
+
+  return (order ?? []).map((id, i) => {
+    const { bucket, q } = byId.get(id);
+    const optionCount = Array.isArray(q.options) ? q.options.length : null;
+    const hasOptions = OPTION_BUCKETS.includes(bucket) && optionCount !== null;
+    return {
+      ...q,
+      position: i + 1,
+      question_bucket: bucket,
+      question_type_key: BUCKET_KEY[bucket] ?? bucket,
+      option_count: optionCount,
+      // The edit path has NO option ceiling, so add is always available on an
+      // option-based question. The 5-option limit applies only to authoring a
+      // new one — enforce it in the add form, never in the editor.
+      can_add_option: hasOptions,
+      can_remove_option: hasOptions && optionCount > MIN_OPTIONS,
+      can_delete: total > 1,
+    };
+  });
+}
+```
+
+Two rules this encodes, both of which matter:
+
+- **`question_order` is the sequence — never infer order from the buckets.** They are
+  storage, and `assessment_data` is a jsonb column, so bucket key order is whatever
+  Postgres returns, not the question order.
+- **`correct_option_index` matches an option's own `index` value, not its array
+  position.** Always resolve it by looking for the option whose `index` equals it.
+  Assessments generated before prompt v4.3 may carry one-based indexes, and that is
+  harmless precisely because every reader matches on the value.
 
 ### Provenance
 
@@ -471,62 +562,7 @@ Provenance is set by the server and cannot be supplied by a client:
 
 ---
 
-### 3. List Questions in Order
-
-**`GET /questions/list/{job_id}`**
-
-The authoritative question sequence, flattened and position-annotated — the natural payload for an editing screen. Use this rather than reading the type buckets yourself.
-
-```bash
-curl --location 'https://portal.uat.karmayogibharat.net/api/ai/assessments/v1/questions/list/<job_id>' \
-  --header 'x-authenticated-user-token: <keycloak_jwt>' \
-  --header 'Authorization: bearer <kong_jwt_credential>'
-```
-
-#### Response
-
-```json
-{
-  "job_id": "do_114..._7fa321bd_1e8b...",
-  "version": 4,
-  "total_questions": 3,
-  "question_order": ["mcq_001", "q_a1b2c3d4e5f6", "ftb_001"],
-  "questions": [
-    {
-      "question_id": "mcq_001",
-      "position": 1,
-      "question_bucket": "Multiple Choice Question",
-      "question_type_key": "mcq",
-      "provenance": "ai_assisted",
-      "question_text": "What is the primary purpose of ...?",
-      "options": [{ "text": "Option A", "index": 0 }, "..."],
-      "correct_option_index": 2,
-      "blooms_level": "Apply",
-      "relevance_percentage": 88,
-      "course_name": "Foundations of Public Policy",
-      "answer_rationale": { "...": "..." },
-      "reasoning": { "...": "..." }
-    }
-  ]
-}
-```
-
-`position` is 1-based and derived from `question_order`. `question_bucket` is the key this question lives under in `assessment_data.questions`; `question_type_key` is the short form (`mcq`, `ftb`, `mtf`, `multichoice`, `truefalse`).
-
-Each question also carries affordance state, so the editor can disable controls rather than discovering a rule from a rejected save:
-
-| Field | Meaning |
-|---|---|
-| `option_count` | Number of options, or `null` for types without options |
-| `can_add_option` | `true` for any option-based question. These flags describe the **edit** path, which has no option ceiling. |
-| `can_remove_option` | `true` only when an option-based question has more than 2 options. Remove is disabled at 2. |
-| `can_delete` | `false` when this is the only question in the assessment |
-
-`can_add_option` is always `true` on an option-based question, because the 5-option ceiling applies only to adding a question — not to editing one. `can_remove_option` turns off once a question is down to its last two options.
-
----
-
-### 4. Edit a Question
+### 3. Edit a Question
 
 **`POST /questions/update/{job_id}`**
 
@@ -591,26 +627,27 @@ Any other path returns 400 `field_not_editable`. `question_id`, `question_type` 
 
 ```json
 {
-  "message": "Saved successfully",
+  "code": "saved",
   "status": "COMPLETED",
   "job_id": "...",
   "version": 5,
   "question_order": ["mcq_001", "q_a1b2c3d4e5f6", "ftb_001"],
   "total_questions": 3,
-  "alerts": [
-    { "code": "answer_key_changed", "severity": "high",
-      "message": "The correct answer for this question will change.", "field": "correct_option_index" }
-  ],
-  "announcement": null,
   "question": { "...": "the saved question, including its updated provenance" }
 }
 ```
 
-`"Saved successfully"` is returned only after the database has confirmed the write — safe to surface directly to the user. If every submitted value already matched what was stored, the response is `"No changes to save"` and the version does not move.
+The write is confirmed by the database before this returns, so a successful response
+means the change is durable. If every submitted value already matched what was stored,
+`code` is `"no_changes"` and the version does not move.
+
+Take `version` from every response and use it on your next call. There is no `alerts`
+array and no `announcement` — the impact of the change and anything read aloud are
+[yours to produce](#what-the-client-owns).
 
 ---
 
-### 5. Add a Question
+### 4. Add a Question
 
 **`POST /questions/create/{job_id}`** → **201 Created**
 
@@ -669,76 +706,75 @@ The response mirrors the edit response and adds `question_id` for the new questi
 
 ---
 
-### 6. Delete a Question
+### 5. Delete a Question
 
 **`POST /questions/delete/{job_id}`**
 
-Deletion requires explicit confirmation, and the last remaining question cannot be deleted. This is a `POST`, not a `DELETE`, because `questionId` and `confirm` are body fields and a `DELETE` must not carry a body.
+The last remaining question cannot be deleted. This is a `POST`, not a `DELETE`, because `questionId` is a body field and a `DELETE` must not carry a body.
+
+**Confirm in your own UI, then call this once.** There is no `confirm` flag and no
+`dry_run`: both were server-side stand-ins for a dialog, and a flag checked here stopped
+nothing because any caller that wanted the deletion simply set it. This call deletes.
 
 ```bash
-# Step 1 — fetch the confirmation content (nothing is deleted)
-curl --location '.../questions/delete/<job_id>?dry_run=true' \
-  --header 'x-authenticated-user-token: <keycloak_jwt>' \
-  --header 'Content-Type: application/json' \
-  --data '{ "request": { "questionId": "mcq_001" } }'
-
-# Step 2 — the user confirmed
 curl --location '.../questions/delete/<job_id>' \
   --header 'x-authenticated-user-token: <keycloak_jwt>' \
   --header 'Content-Type: application/json' \
-  --data '{ "request": { "questionId": "mcq_001", "confirm": true, "version": 6 } }'
+  --data '{ "request": { "questionId": "mcq_001", "version": 6 } }'
 ```
 
 | Field | In | Description |
 |---|---|---|
 | `questionId` | body | Required. Missing, non-string or blank returns 400 `question_id_required` / `question_id_invalid`. |
-| `confirm` | body | Must be `true`. Without it: 400 `confirmation_required`. A non-boolean returns 400 `confirm_invalid`. |
 | `version` | body | Version this delete is based on. |
-| `dry_run` | query | `true` returns the confirmation content (`alerts`, `position`, `remaining_questions`) without deleting. |
 
-Deleting the only remaining question returns 400 `last_question_cannot_be_deleted`. A `questionId` naming no question in this assessment returns **404** `question_not_found` — the unknown-identifier case is a 404 whether the id arrives in the path or the body, and it is checked before `confirm`.
+Deleting the only remaining question returns 400 `last_question_cannot_be_deleted` — check `can_delete` (see [Building the editor list](#building-the-editor-list)) to disable the control instead of discovering this from a rejected call. A `questionId` naming no question in this assessment returns **404** `question_not_found`.
 
 ---
 
-### 7. Reorder Questions
+### 6. Reorder Questions
 
 **`POST /questions/order/{job_id}`**
 
-Two forms. Send the complete sequence for a drag-and-drop reorder, or move one question for a keyboard reorder.
+Send the complete new sequence. There is one input form: a single-question move
+("this one, one step up") is expressed by sending the sequence it produces, because
+you hold the whole array and the move is a splice.
 
 ```bash
-# Form A — the complete new sequence
 curl --location '.../questions/order/<job_id>' \
   --header 'Content-Type: application/json' \
   --data '{ "request": { "version": 6,
             "questionOrder": ["ftb_001", "mcq_001", "q_a1b2c3d4e5f6"] } }'
-
-# Form B — move a single question (keyboard reorder)
-curl --location '.../questions/order/<job_id>' \
-  --header 'Content-Type: application/json' \
-  --data '{ "request": { "version": 6, "questionId": "mcq_001", "position": 1 } }'
 ```
 
-`questionOrder` must list every question in the assessment exactly once. A partial, padded or duplicated list returns 400 `question_order_invalid` rather than being partially applied — a stale client cannot drop questions by sending an out-of-date array.
+`questionOrder` must list every question in the assessment exactly once. A partial, padded or duplicated list returns 400 `question_order_invalid` (with `missing`, `unknown` and `duplicated` in `params`) rather than being partially applied — a stale client cannot drop questions by sending an out-of-date array. Omitting it entirely returns 400 `question_order_required`.
+
+**Reorder locally, save once.** Let the user shuffle freely and re-render optimistically,
+then send the final sequence when they settle. One call per drag session, not one per
+move — each call is a version bump and a round trip.
+
+Unlike the rest of the editing workspace, this one genuinely cannot move client-side:
+`question_order` is what every export reads, each moved question gets an audit row, and
+the permutation check above is precisely a guard against the client being stale.
 
 #### Response
 
 ```json
 {
-  "message": "Saved successfully",
+  "code": "saved",
+  "status": "COMPLETED",
+  "job_id": "...",
   "version": 7,
   "question_order": ["ftb_001", "mcq_001", "q_a1b2c3d4e5f6"],
-  "total_questions": 3,
-  "alerts": [{ "code": "order_changed", "severity": "info", "message": "Question moved from position 2 to position 1 of 3." }],
-  "announcement": "Question moved from position 2 to position 1 of 3."
+  "total_questions": 3
 }
 ```
 
-`announcement` is plain text intended for an ARIA live region, so screen-reader users hear the result of the move. If the requested order matches the current one, the response is `"Question order unchanged"` and the version does not move.
+If the requested order matches the current one, `code` is `"order_unchanged"` and the version does not move. Compose any screen-reader announcement from the returned `question_order` — see [What the client owns](#what-the-client-owns).
 
 ---
 
-### 8. Get Audit Trail
+### 7. Get Audit Trail
 
 **`GET /audit/{job_id}`**
 
@@ -762,7 +798,6 @@ curl --location '.../audit/<job_id>?limit=200&offset=0' \
       "id": 41,
       "assessment_version": 5,
       "event_code": "TEL-03",
-      "event_name": "Question Edit Saved",
       "editor_id": "1e8b6826-3326-4175-b202-f5f5971f457a",
       "question_id": "mcq_001",
       "question_type": "mcq",
@@ -784,7 +819,7 @@ curl --location '.../audit/<job_id>?limit=200&offset=0' \
 
 | Field | Description |
 |---|---|
-| `event_code` | Question Edit Saved · Question Added · Question Deleted · Question Reordered · Correct Answer Changed · Mapping Updated |
+| `event_code` | `TEL-03` Question Edit Saved · `TEL-05` Question Added · `TEL-06` Question Deleted · `TEL-07` Question Reordered · `TEL-10` Correct Answer Changed · `TEL-11` Mapping Updated. The code is the whole fact — there is no display-name field, because the wording is [yours](#what-the-client-owns). |
 | `editor_id` | The user who made the change |
 | `changed_fields` | Each changed field with its previous and new value |
 | `original_question` | The AI-generated question, captured on the first human edit. `null` for human-authored questions. |
@@ -799,7 +834,7 @@ These six audit feeds are the only record kept of a reviewer's activity. Nothing
 
 ---
 
-### 9. Update Whole Assessment (legacy)
+### 8. Update Whole Assessment (legacy)
 
 **`PUT /update/{job_id}`**
 
@@ -829,7 +864,7 @@ curl --location --request PUT '.../update/<job_id>' \
 
 ---
 
-### 10. Get History
+### 9. Get History
 
 **`GET /history`**
 
@@ -906,7 +941,7 @@ curl --location 'https://portal.uat.karmayogibharat.net/apis/proxies/v8/ai/asses
 
 ---
 
-### 11. Download Assessment
+### 10. Download Assessment
 
 **`GET /download/{job_id}?format={format}`**
 
@@ -1050,20 +1085,20 @@ if (selected.status === 'COMPLETED') {
 The reviewer composes the final question set in the platform. Downloads and publication then use exactly what was saved.
 
 ```
-1. GET  /questions/list/{job_id}             → ordered questions + version
+1. GET  /status/{job_id}                     → assessment_data + version
+        └─ editorList(assessment_data)       → ordered, annotated questions  [client-side]
                                                       │
 2. User edits question N                              │
-   ├─ (optional) POST /questions/update/{job_id}?dry_run=true
-   │             { request: { questionId, updates } }
-   │                    → alerts + changed_fields  → show confirmation dialog
+   ├─ diff local before/after                         │  [client-side]
+   │     → impact warnings, confirmation dialog        │   no API call
    │                                                  │
    └─ POST /questions/update/{job_id}                 │
       { request: { questionId, version, updates } }   │
                     ┌─────────────────────────────────┴────────────────┐
                     │ 200                     │ 400              │ 409 │
                     ▼                         ▼                  ▼
-        "Saved successfully"          show errors[]       reload, re-apply
-        keep the new version          nothing saved       nothing saved
+          durable — keep version       render errors[]     reload, re-apply
+                                       via code+params      nothing saved
                     │
 3. Add / delete / reorder as needed — each returns the new version
                     │
@@ -1074,33 +1109,41 @@ The reviewer composes the final question set in the platform. Downloads and publ
 **Implementation example (pseudocode):**
 
 ```js
-// 1. Load the editing workspace
-let { version, questions } = await GET(`/questions/list/${jobId}`);
+// 1. Load once; the editor list is a local projection (see "Building the editor list")
+let { assessment_data, version } = await GET(`/status/${jobId}`);
+let questions = editorList(assessment_data);
 
-// 2. Preview, then save. questionId is a body field, not a path segment.
+// 2. Confirm locally — you already hold the before-state, so no preview call
+const before = questions.find((q) => q.question_id === qid);
 const updates = { question_text: newText, correct_option_index: newIndex };
+if (!await confirmWithUser(impactOf(before, updates))) return;   // cancel = do nothing
 
-const preview = await POST(`/questions/update/${jobId}?dry_run=true`,
-                           { request: { questionId: qid, updates, version } });
-if (!preview.valid) return showErrors(preview.errors);
-if (!await confirmWithUser(preview.alerts, preview.changed_fields)) return;  // cancel = do nothing
-
+// 3. Save
 const res = await POST(`/questions/update/${jobId}`,
                        { request: { questionId: qid, updates, version } });
 
 if (res.status === 409) {
   // someone else saved first — nothing was written
-  ({ version, questions } = await GET(`/questions/list/${jobId}`));
+  ({ assessment_data, version } = await GET(`/status/${jobId}`));
+  questions = editorList(assessment_data);
   return showConflict();
 }
-if (res.status === 400) return showErrors(res.errors);
+if (res.status === 400) {
+  // code + params -> your own localized copy
+  return showErrors(res.errors.map((e) => t(e.code, e.params)));
+}
 
-version = res.version;              // carry the new version into the next edit
-toast(res.message);                 // "Saved successfully" — the backend has confirmed it
-announce(res.announcement);         // ARIA live region, for reorder feedback
+version = res.version;                  // carry the new version into the next edit
+toast(t("saved"));                      // your copy, your language
+announce(t("saved_position", { total: res.total_questions }));   // ARIA live region
 ```
 
-Cancelling an edit needs no API call to undo anything — discard local state and re-read the question. There is nothing to report: the editor makes no calls the user did not ask for.
+`impactOf(before, updates)` is the client-side replacement for the old `dry_run` call.
+The one case worth implementing carefully: if the option texts before and after are the
+same multiset in a different order, this is a **reorder**, so say "options reordered" —
+not "the correct answer will change", even though `correct_option_index` differs.
+
+Cancelling an edit needs no API call to undo anything — discard local state and re-render from the copy you hold. The editor makes no calls the user did not ask for.
 
 ---
 
@@ -1134,16 +1177,31 @@ Cancelling an edit needs no API call to undo anything — discard local state an
 }
 ```
 
-Validation failures (400) on the editing endpoints add a machine-readable `errors` array while keeping `detail` a plain string:
+That prose shape applies to generation, status and download. **Every failure on the
+editing endpoints** — `/questions/*`, `/audit`, `/update` — returns the machine-readable
+shape instead, not just 400s. `detail` is the primary error's `code`, and `errors` carries
+the detail:
+
+| `code` | HTTP | Meaning |
+|---|---|---|
+| `assessment_not_found` | 404 | No assessment with that `job_id` |
+| `assessment_access_denied` | 403 | Authenticated, but not the owner |
+| `assessment_not_editable` | 409 | Generation has not finished — `params.status` holds the current status |
+| `version_conflict` | 409 | Changed since you read it — `params.current_version` |
+| `if_match_invalid` | 400 | `If-Match` was not an integer version |
 
 ```json
 {
-  "detail": "This question type must have at least 2 options (found 1).",
+  "detail": "option_count_invalid",
   "errors": [
-    { "code": "option_count_invalid", "message": "...", "field": "options", "question_id": "mcq_001" }
+    { "code": "option_count_invalid", "field": "options", "question_id": "mcq_001",
+      "params": { "minimum": 2, "maximum": 5, "found": 1 } }
   ]
 }
 ```
+
+`errors[]` entries carry **no `message`** — map `code` to your own copy and interpolate
+`params`. See [Validation](#validation) for the full code/params table.
 
 ---
 
@@ -1155,5 +1213,7 @@ Validation failures (400) on the editing endpoints add a machine-readable `error
 - **Multi-course assessments:** Pass multiple `course_ids` and set `assessment_type=comprehensive`. Use `course_weightage` to control the proportion of questions per course.
 - **Question order is data, not presentation.** `assessment_data.question_order` is the authoritative sequence. Do not infer order from the type buckets — they only store content.
 - **Always send `version` on editing calls.** Without it a stale screen can silently overwrite someone else's change; with it the call fails cleanly with 409.
-- **Cache reuse skips edited assessments.** A `/generate` request only clones a previously generated assessment that no one has edited, so another user's reviewer edits are never handed to you as fresh AI output.
+- **A clone is never another reviewer's edits.** A `/generate` cache hit may match an assessment that has since been edited, but what it clones is the pristine AI-generated copy retained for audit — so another user's reviewer edits are never handed to you as fresh AI output.
 - **Editing requires `COMPLETED` status.** Editing calls against a `PENDING`, `IN_PROGRESS` or `FAILED` job return 409.
+- **The editing API returns no user-facing copy.** No sentence on errors, no `message` on successful writes (they carry an outcome `code` instead), no `alerts`, no `announcement`, and no display name on audit rows. Impact warnings, confirmation dialogs, screen-reader text and error wording are all client-side — see [What the client owns](#what-the-client-owns).
+- **`correct_option_index` is an option's `index` value, not its array position.** Resolve it by matching on the value.

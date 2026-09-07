@@ -45,8 +45,6 @@ from .validation import (
     MAPPING_FIELDS,
     SERVER_OWNED_FIELDS,
     ValidationError,
-    build_change_alerts,
-    build_delete_alerts,
     classify_option_change,
     get_path,
     set_path,
@@ -70,14 +68,21 @@ AUDIT_QUESTION_REORDERED = "TEL-07"
 AUDIT_CORRECT_ANSWER_CHANGED = "TEL-10"
 AUDIT_MAPPING_UPDATED = "TEL-11"
 
-AUDIT_EVENT_NAMES: Dict[str, str] = {
-    AUDIT_QUESTION_EDIT_SAVED: "Question Edit Saved",
-    AUDIT_QUESTION_ADDED: "Question Added",
-    AUDIT_QUESTION_DELETED: "Question Deleted",
-    AUDIT_QUESTION_REORDERED: "Question Reordered",
-    AUDIT_CORRECT_ANSWER_CHANGED: "Correct Answer Changed",
-    AUDIT_MAPPING_UPDATED: "Mapping Updated",
-}
+# The codes that are persisted to the audit trail — exactly six feeds.
+#
+# There is deliberately no display name alongside them. A label like "Question
+# Edit Saved" is English copy, and the copy belongs to the client because the
+# client owns the user's language and this service serves twelve of them — the
+# same rule that keeps a sentence out of every validation error (see
+# `validation._err`). A client renders these codes through its own string table.
+AUDIT_EVENT_CODES: frozenset = frozenset({
+    AUDIT_QUESTION_EDIT_SAVED,
+    AUDIT_QUESTION_ADDED,
+    AUDIT_QUESTION_DELETED,
+    AUDIT_QUESTION_REORDERED,
+    AUDIT_CORRECT_ANSWER_CHANGED,
+    AUDIT_MAPPING_UPDATED,
+})
 
 
 @dataclass
@@ -87,9 +92,7 @@ class EditResult:
     assessment_data: Dict[str, Any]
     # Every audit event this operation produced, in order.
     events: List[Dict[str, Any]] = field(default_factory=list)
-    alerts: List[Dict[str, Any]] = field(default_factory=list)
     question: Optional[Dict[str, Any]] = None
-    announcement: Optional[str] = None
 
     @property
     def audit_rows(self) -> List[Dict[str, Any]]:
@@ -98,7 +101,7 @@ class EditResult:
         Question Edit Saved, Question Added, Question Deleted, Question
         Reordered, Correct Answer Changed and Mapping Updated.
         """
-        return [e for e in self.events if e["event_code"] in AUDIT_EVENT_NAMES]
+        return [e for e in self.events if e["event_code"] in AUDIT_EVENT_CODES]
 
     @property
     def changed(self) -> bool:
@@ -120,7 +123,6 @@ def _event(
 ) -> Dict[str, Any]:
     return {
         "event_code": event_code,
-        "event_name": AUDIT_EVENT_NAMES.get(event_code, event_code),
         "editor_id": editor_id,
         "question_id": question_id,
         "question_type": question_type,
@@ -190,7 +192,6 @@ def apply_question_edit(
     if entry is None:
         raise ValidationError([{
             "code": "question_not_found",
-            "message": f"No question with id '{question_id}' in this assessment.",
             "field": "question_id", "question_id": question_id,
         }])
 
@@ -307,41 +308,8 @@ def apply_question_edit(
     return EditResult(
         assessment_data=data,
         events=events,
-        alerts=build_change_alerts(bucket, before, changed_fields),
         question=copy.deepcopy(question),
     )
-
-
-def preview_question_edit(
-    assessment_data: Dict[str, Any],
-    question_id: str,
-    updates: Dict[str, Any],
-    *,
-    editor_id: str,
-    enable_blooms: bool = True,
-) -> Dict[str, Any]:
-    """
-    Compute the alerts and validation errors a pending edit would
-    produce, without applying it. Backs `dry_run=true` so the client can show
-    the pre-update alert before committing the save.
-    """
-    try:
-        result = apply_question_edit(
-            assessment_data, question_id, updates,
-            editor_id=editor_id, enable_blooms=enable_blooms,
-        )
-    except ValidationError as exc:
-        return {"valid": False, "errors": exc.errors, "alerts": [], "changed_fields": []}
-
-    return {
-        "valid": True,
-        "errors": [],
-        "alerts": result.alerts,
-        "changed_fields": next(
-            (e["changed_fields"] for e in result.events
-             if e["event_code"] == AUDIT_QUESTION_EDIT_SAVED), []),
-        "question": result.question,
-    }
 
 
 # --------------------------------------------------------------------------
@@ -379,9 +347,9 @@ def apply_question_add(
     if bucket is None:
         raise ValidationError([{
             "code": "question_type_invalid",
-            "message": f"Unknown question type '{question_type}'. "
-                       f"Expected one of: {', '.join(sorted(TYPE_KEY_BY_BUCKET.values()))}.",
             "field": "question_type", "question_id": None,
+            "params": {"found": question_type,
+                       "expected": sorted(TYPE_KEY_BY_BUCKET.values())},
         }])
 
     allowed = _addable_keys(bucket)
@@ -392,9 +360,8 @@ def apply_question_add(
     if rejected:
         raise ValidationError([{
             "code": "field_not_editable",
-            "message": f"'{key}' cannot be set on a new {bucket}. "
-                       f"Accepted fields: {', '.join(sorted(allowed))}.",
             "field": key, "question_id": None,
+            "params": {"question_bucket": bucket, "editable_fields": sorted(allowed)},
         } for key in rejected])
 
     question: Dict[str, Any] = {
@@ -434,14 +401,7 @@ def apply_question_add(
     return EditResult(
         assessment_data=data,
         events=events,
-        alerts=[{
-            "code": "question_added", "severity": "info",
-            "message": f"A human-authored question was added at position "
-                       f"{position_of(data, stored['question_id'])}.",
-        }],
         question=copy.deepcopy(stored),
-        announcement=f"Question added at position {position_of(data, stored['question_id'])} "
-                     f"of {question_count(data)}.",
     )
 
 
@@ -454,21 +414,24 @@ def apply_question_delete(
     question_id: str,
     *,
     editor_id: str,
-    confirmed: bool = False,
 ) -> EditResult:
     """
     Remove a question from the assessment.
 
-    Deletion requires explicit confirmation — the caller must
-    pass `confirmed=True`, which the API surfaces as `confirm=true`. The last
-    remaining question cannot be deleted.
+    The last remaining question cannot be deleted — that is the assessment-level
+    invariant, and it is enforced here as well as by `assessment_empty` in the
+    validation gate.
+
+    There is deliberately no server-side confirmation flag. Confirming a
+    destructive action is a dialog, and a dialog belongs to the client: a flag
+    checked here stops nothing, because any caller that wants the deletion
+    simply sets it.
     """
     data = normalize_assessment(assessment_data)
     entry = find_question(data, question_id)
     if entry is None:
         raise ValidationError([{
             "code": "question_not_found",
-            "message": f"No question with id '{question_id}' in this assessment.",
             "field": "question_id", "question_id": question_id,
         }])
 
@@ -479,17 +442,7 @@ def apply_question_delete(
     if remaining < 1:
         raise ValidationError([{
             "code": "last_question_cannot_be_deleted",
-            "message": "An assessment must contain at least one question, so the "
-                       "last remaining question cannot be deleted.",
             "field": "questions", "question_id": question_id,
-        }])
-
-    if not confirmed:
-        raise ValidationError([{
-            "code": "confirmation_required",
-            "message": "Deleting a question requires explicit confirmation. "
-                       "Retry with confirm=true.",
-            "field": "confirm", "question_id": question_id,
         }])
 
     snapshot = copy.deepcopy(question)
@@ -510,47 +463,8 @@ def apply_question_delete(
     return EditResult(
         assessment_data=data,
         events=events,
-        alerts=[{
-            "code": "question_deleted", "severity": "info",
-            "message": f"Question removed from position {previous_position}. "
-                       f"{remaining} question(s) remain.",
-        }],
         question=snapshot,
-        announcement=f"Question removed from position {previous_position}. "
-                     f"{remaining} question(s) remain.",
     )
-
-
-def preview_question_delete(
-    assessment_data: Dict[str, Any], question_id: str
-) -> Dict[str, Any]:
-    """The confirmation content for a pending deletion."""
-    data = normalize_assessment(assessment_data)
-    entry = find_question(data, question_id)
-    if entry is None:
-        return {
-            "valid": False,
-            "errors": [{
-                "code": "question_not_found",
-                "message": f"No question with id '{question_id}' in this assessment.",
-                "field": "question_id", "question_id": question_id,
-            }],
-            "alerts": [],
-        }
-    bucket, _, question = entry
-    remaining = question_count(data) - 1
-    return {
-        "valid": remaining >= 1,
-        "errors": [] if remaining >= 1 else [{
-            "code": "last_question_cannot_be_deleted",
-            "message": "An assessment must contain at least one question, so the "
-                       "last remaining question cannot be deleted.",
-            "field": "questions", "question_id": question_id,
-        }],
-        "alerts": build_delete_alerts(bucket, question, remaining),
-        "position": position_of(data, question_id),
-        "remaining_questions": remaining,
-    }
 
 
 # --------------------------------------------------------------------------
@@ -561,66 +475,42 @@ def apply_question_reorder(
     assessment_data: Dict[str, Any],
     *,
     editor_id: str,
-    question_order: Optional[List[str]] = None,
-    question_id: Optional[str] = None,
-    position: Optional[int] = None,
+    question_order: List[str],
 ) -> EditResult:
     """
-    Re-sequence the assessment. Two forms are supported:
+    Re-sequence the assessment.
 
-      * `question_order` — the complete new sequence. Must be a permutation of
-        the ids currently in the assessment: a partial or padded list is
-        rejected rather than partially applied, so a stale client cannot drop
-        questions by sending an out-of-date array.
-      * `question_id` + `position` — move a single question to a 1-based
-        position. This is the form a keyboard reorder produces, where
-        the client only knows "this one, one step up".
+    `question_order` is the complete new sequence, and must be a permutation of
+    the ids currently in the assessment: a partial or padded list is rejected
+    rather than partially applied, so a stale client cannot drop questions by
+    sending an out-of-date array. That check is the reason this operation
+    cannot move to the client — it is the guard against the client being wrong.
 
-    One audit row is written per question whose position actually changed, and
-    `announcement` carries text suitable for a screen-reader live region.
+    A single-question move ("this one, one step up") is deliberately NOT a
+    second input form. The client holds the whole sequence, so computing the
+    resulting permutation is a splice; accepting a move instead meant a second
+    server code path to express something the caller already knew.
+
+    One audit row is written per question whose position actually changed.
     """
     data = normalize_assessment(assessment_data)
     current: List[str] = [str(q) for q in data["question_order"]]
 
-    if question_order is not None:
-        requested = [str(q) for q in question_order]
-        if sorted(requested) != sorted(current):
-            missing = sorted(set(current) - set(requested))
-            unknown = sorted(set(requested) - set(current))
-            raise ValidationError([{
-                "code": "question_order_invalid",
-                "message": "question_order must list every question in the assessment "
-                           "exactly once."
-                           + (f" Missing: {', '.join(missing)}." if missing else "")
-                           + (f" Unknown: {', '.join(unknown)}." if unknown else "")
-                           + (" Duplicate ids were supplied."
-                              if len(set(requested)) != len(requested) else ""),
-                "field": "question_order", "question_id": None,
-            }])
-        new_order = requested
-        moved_label = None
-    elif question_id is not None and position is not None:
-        qid = str(question_id)
-        if qid not in current:
-            raise ValidationError([{
-                "code": "question_not_found",
-                "message": f"No question with id '{qid}' in this assessment.",
-                "field": "question_id", "question_id": qid,
-            }])
-        target = max(1, min(int(position), len(current)))
-        new_order = [q for q in current if q != qid]
-        new_order.insert(target - 1, qid)
-        moved_label = qid
-    else:
+    requested = [str(q) for q in question_order or []]
+    if sorted(requested) != sorted(current):
         raise ValidationError([{
-            "code": "reorder_input_required",
-            "message": "Provide either question_order, or question_id together with "
-                       "position.",
+            "code": "question_order_invalid",
             "field": "question_order", "question_id": None,
+            "params": {
+                "missing": sorted(set(current) - set(requested)),
+                "unknown": sorted(set(requested) - set(current)),
+                "duplicated": len(set(requested)) != len(requested),
+            },
         }])
+    new_order = requested
 
     if new_order == current:
-        return EditResult(assessment_data=data, announcement="Question order unchanged.")
+        return EditResult(assessment_data=data)
 
     data["question_order"] = new_order
     index = index_questions(data)
@@ -641,21 +531,7 @@ def apply_question_reorder(
             new_position=new_index,
         ))
 
-    if moved_label:
-        new_index = new_order.index(moved_label) + 1
-        old_index = current.index(moved_label) + 1
-        announcement = (f"Question moved from position {old_index} to position "
-                        f"{new_index} of {len(new_order)}.")
-    else:
-        announcement = (f"Question order updated. {len(events)} of "
-                        f"{len(new_order)} questions changed position.")
-
-    return EditResult(
-        assessment_data=data,
-        events=events,
-        alerts=[{"code": "order_changed", "severity": "info", "message": announcement}],
-        announcement=announcement,
-    )
+    return EditResult(assessment_data=data, events=events)
 
 
 # --------------------------------------------------------------------------

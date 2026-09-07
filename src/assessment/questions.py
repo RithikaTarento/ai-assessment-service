@@ -118,12 +118,6 @@ MAX_OPTION_COUNT_ON_ADD: Dict[str, Optional[int]] = {
     BUCKET_MULTICHOICE: 5,
 }
 
-# The types whose answer options are editable as options. These live
-# here rather than in validation.py so the ordered-question projection can
-# report the add/remove affordance state without importing validation.
-OPTION_BUCKETS = (BUCKET_MCQ, BUCKET_MULTICHOICE)
-
-
 def resolve_bucket(name: str) -> Optional[str]:
     """Accept a bucket name, a short type key, or a question_type const."""
     if not name:
@@ -476,41 +470,6 @@ def iter_questions_in_order(
             if qid not in emitted:
                 emitted.add(qid)
                 yield bucket, question
-
-
-def ordered_questions(assessment_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Flat, 1-based, position-annotated view of the assessment — what the editing
-    UI renders and what `GET /questions/list/{job_id}` returns.
-    """
-    out: List[Dict[str, Any]] = []
-    total = question_count(assessment_data)
-    for position, (bucket, question) in enumerate(iter_questions_in_order(assessment_data), start=1):
-        item = copy.deepcopy(question)
-        item["position"] = position
-        item["question_bucket"] = bucket
-        item["question_type_key"] = TYPE_KEY_BY_BUCKET.get(bucket, bucket)
-
-        # Affordance state, so the client can disable controls rather than
-        # discovering the rule from a rejected save.
-        options = question.get("options")
-        option_count = len(options) if isinstance(options, list) else None
-        item["option_count"] = option_count
-        if bucket in OPTION_BUCKETS and option_count is not None:
-            # These describe the *edit* path, which this projection feeds, so
-            # they mirror the floor only. `MAX_OPTION_COUNT_ON_ADD` is not
-            # consulted: it constrains authoring a new question, and reporting it
-            # here would disable a control the edit endpoint accepts.
-            item["can_add_option"] = True
-            item["can_remove_option"] = option_count > MIN_OPTION_COUNT
-        else:
-            item["can_add_option"] = False
-            item["can_remove_option"] = False
-        # The last remaining question cannot be deleted.
-        item["can_delete"] = total > 1
-
-        out.append(item)
-    return out
 
 
 def question_count(assessment_data: Dict[str, Any]) -> int:

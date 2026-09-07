@@ -213,7 +213,7 @@ ai-assessment-service/
 │       ├── generator.py             ← LLM prompt engineering & parsing
 │       ├── batching.py              ← Sequential batch planning/merging for large assessments
 │       ├── questions.py             ← Editable question model: ids, ordering, provenance
-│       ├── validation.py            ← Validation gate + pre-update alerts
+│       ├── validation.py            ← Validation gate
 │       ├── editing.py               ← Edit / add / delete / reorder operations + audit
 │       ├── fetcher.py               ← Karmayogi Learning API client
 │       ├── db.py                    ← PostgreSQL async operations
@@ -289,7 +289,7 @@ The LLM returns questions grouped into type buckets with no single sequence. Thi
 adds what the editing workspace needs without breaking that shape.
 
 - `normalize_assessment()` — idempotent; guarantees a unique `question_id` and a valid `provenance` on every question, fills each option's `index`, and builds/repairs the top-level `question_order` array. It backfills assessments generated before these fields existed, which is why no data migration is needed
-- `iter_questions_in_order()` / `ordered_questions()` — iterate the authoritative sequence; used by every exporter and by `GET .../questions`
+- `iter_questions_in_order()` — iterate the authoritative sequence; used by every exporter. There is deliberately no flat/position-annotated projection here: that is a presentation shape a client derives from `question_order` in a few lines
 - `question_order` is the authoritative sequence; the type buckets remain the authoritative content store
 
 #### `validation.py` — The validation gate
@@ -302,8 +302,8 @@ Covers the five limbs the specification names — question, answer, option, mapp
 - `validate_mapping()` — the competency triple is all-or-nothing, and mapping fields cannot be blanked. The KCM **vocabulary** check (against `resources/competencies.json`) runs only when a competency field is actually edited, because generated questions occasionally carry a label that is not an exact dataset match and a blanket check would make unrelated edits impossible on those questions
 - `validate_assessment()` — assessment-level invariants (at least one question, unique ids), plus per-question rules scoped to the questions a save actually touches, so a gap in an older question cannot block an unrelated edit
 - `EDITABLE_FIELDS` — the per-type allowlist of editable dotted paths. Server-owned fields (`question_id`, `question_type`, `provenance`) are never client-writable
-- `build_change_alerts()` / `build_delete_alerts()` — pre-update alert content, with severities
-- `classify_option_change()` — distinguishes a pure re-sequencing of the options from a real content or answer-key edit, so reordering them does not report itself as "the correct answer will change"
+- Errors are `code` + `field` + `question_id` + a `params` bag, and carry **no message string** — the client maps the code to its own copy, because it owns the user's language and this service serves twelve of them
+- `classify_option_change()` — distinguishes a pure re-sequencing of the options from a real content or answer-key edit. Retained server-side because the **audit trail** records the distinction (`options_reordered`, `reindexed_only`); it is not presentation
 
 #### `editing.py` — Editing operations
 Pure functions: current `assessment_data` in, new copy plus audit rows out. No database or
@@ -313,8 +313,9 @@ HTTP concerns, so the rules are identical no matter which endpoint drove the cha
 - `diff_assessments()` — derives the same audit rows from a before/after comparison, backing the legacy whole-blob `PUT`
 - Enforces the provenance transitions: `ai_generated` → `ai_assisted` on first edit; manually added questions are `human_authored` and stay so however often they are edited
 
-Audit events are declared in `AUDIT_EVENT_NAMES` — the six kinds of change the audit
-trail records:
+Audit events are declared in `AUDIT_EVENT_CODES` — the six kinds of change the audit
+trail records. Only the code is stored; the display name below is this document's
+wording, not a field, because the copy belongs to the client:
 
 | Audit event |
 |---|
@@ -533,18 +534,22 @@ uv run streamlit run ui/app.py
 | `GET` | `/history` | All jobs by the authenticated user |
 | `GET` | `/download/{job_id}?format=<fmt>` | Download result (csv/csv_basic/json/pdf/docx) |
 | **Editing workspace** | | |
-| `GET` | `/questions/list/{job_id}` | Questions in authoritative order, position-annotated |
 | `POST` | `/questions/create/{job_id}` | Add a question manually — returns `201` on success |
 | `POST` | `/questions/update/{job_id}` | Edit one question in place — `questionId` in the body |
-| `POST` | `/questions/delete/{job_id}` | Delete a question — `questionId` + `confirm: true` in the body |
+| `POST` | `/questions/delete/{job_id}` | Delete a question — `questionId` in the body |
 | `POST` | `/questions/order/{job_id}` | Reorder questions — `questionOrder` array in the body |
 | `GET` | `/audit/{job_id}` | Audit trail of all human changes |
 | `PUT` | `/update/{job_id}` | Replace the whole assessment (legacy; prefer the granular endpoints) |
 
 Every editing call is validated, versioned and audited. Send the assessment's `version`
 (body field or `If-Match` header) so a concurrent update fails with `409` instead of
-silently overwriting someone else's change. Add `?dry_run=true` to preview a change and
-its alerts without saving.
+silently overwriting someone else's change.
+
+These endpoints persist, validate and audit; they do not present. There is no `dry_run`,
+no `confirm` flag, no `alerts` array, no `announcement`, and no message strings on
+errors — impact warnings, confirmation dialogs, screen-reader copy and error wording all
+belong to the client, which rendered the before-state and knows the user's language. See
+`integration/API_INTEGRATION_GUIDE.md` → *What the client owns*.
 
 **Path shape.** These endpoints are routed by a Kong `API` entity (Kong 0.10–0.14), which
 can only prefix-match: it strips the matched prefix and appends the remaining path
@@ -727,8 +732,7 @@ row exists if and only if the change was actually persisted.
 | `id` | BIGSERIAL PRIMARY KEY | Insertion order — also the chronological order |
 | `job_id` | TEXT | The assessment this change belongs to |
 | `assessment_version` | INTEGER | The version this change produced |
-| `event_code` | TEXT | Question Edit Saved (edited) · Question Added · Question Deleted · Question Reordered |
-| `event_name` | TEXT | Human-readable event name |
+| `event_code` | TEXT | `TEL-03` Question Edit Saved · `TEL-05` Question Added · `TEL-06` Question Deleted · `TEL-07` Question Reordered · `TEL-10` Correct Answer Changed · `TEL-11` Mapping Updated |
 | `editor_id` | TEXT | The user who made the change |
 | `question_id` | TEXT | Affected question |
 | `question_type` | TEXT | `mcq` / `ftb` / `mtf` / `multichoice` / `truefalse` |
@@ -888,4 +892,6 @@ Options are re-sequenced within a question through the ordinary `POST /questions
 
 A client's answer-key control must select an **option**, not an index. Offer bare index numbers next to a reorder control and the two readings of "3" — *the option currently at index 3* versus *the index the correct option should end up at* — pick different options, and the reviewer has no way to tell which one they got. The Streamlit editor labels every entry with the option's own text for exactly this reason.
 
-`build_change_alerts()` / `classify_option_change()` tell a pure re-sequencing (same option texts, new order) apart from a genuine content edit, so a reorder raises `options_reordered` + `answer_key_reindexed` rather than the high-severity "the correct answer will change". The distinction is recorded on the audit row too — `options_reordered` on Question Edit Saved, `reindexed_only` on Correct Answer Changed.
+`classify_option_change()` tells a pure re-sequencing (same option texts, new order) apart from a genuine content edit, and the **audit row** records the distinction — `options_reordered` on Question Edit Saved, `reindexed_only` on Correct Answer Changed. Without it the trail would read as a reviewer changing the answer key, which is the one thing an audit of an assessment must not get wrong.
+
+A client showing a pre-save warning needs the same comparison, and must make it locally: same option texts in a new order means "options reordered", not "the correct answer will change".

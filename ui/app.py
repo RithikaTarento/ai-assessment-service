@@ -7,6 +7,14 @@ import json
 import os
 from dotenv import load_dotenv
 
+# Logic the API used to serve and the client now owns: the ordered question
+# list, pre-save impact warnings, validation-error copy and announcements.
+# See ui/client_side.py — a production frontend ports that file.
+from client_side import (
+    editor_list, impact_of, delete_impact, error_text, changed_fields,
+    announce_added, announce_deleted, announce_reordered, outcome_text,
+)
+
 # Load local .env if present
 load_dotenv()
 
@@ -495,61 +503,63 @@ with tab_view:
                 except Exception:
                     st.error(f"{prefix} ({resp.status_code}): {resp.text}")
                     return
-                if resp.status_code == 409:
-                    st.error(
-                        f"⚠️ Concurrent update detected. {body.get('detail')} "
-                        f"(current version: {body.get('current_version')})"
-                    )
+                # The editing endpoints send code + params, never a sentence —
+                # the copy is ours. Endpoints outside the editing workspace
+                # (generation, download) still send prose in `detail`.
+                errors = body.get("errors") or []
+                if errors:
+                    st.error(f"{prefix}: {error_text(errors[0])}")
+                    for err in errors[1:]:
+                        st.warning(f"• `{err.get('field')}` — {error_text(err)}")
                     return
                 st.error(f"{prefix} ({resp.status_code}): {body.get('detail')}")
-                for err in body.get("errors", []):
-                    st.warning(f"• `{err.get('field')}` — {err.get('message')}")
 
             def show_alerts(alerts):
-                """Render the pre-update / post-save alerts."""
+                """Render locally-computed impact warnings."""
                 icons = {"high": "🔴", "medium": "🟠", "low": "🟡", "info": "ℹ️"}
                 for alert in alerts or []:
                     st.write(f"{icons.get(alert.get('severity'), '•')} {alert.get('message')}")
 
             @st.dialog("Delete this question?")
-            def confirm_delete_dialog(qid, version, preview_text, job_key):
+            def confirm_delete_dialog(qid, version, preview_text, job_key,
+                                      question, position, remaining):
                 """
-                Explicit confirmation, as a modal the user must act on
-                rather than a checkbox ticked ahead of time.
+                Explicit confirmation, as a modal the user must act on rather than
+                a checkbox ticked ahead of time.
+
+                Confirmation lives entirely here. The API has no `confirm` flag and
+                no dry-run preview: a server-side gate stopped nothing, because any
+                caller that wanted the deletion simply set it.
                 """
                 if preview_text:
                     st.write(f"**{preview_text}**")
                 st.warning("This will permanently remove the question from the "
                            "assessment. This cannot be undone.")
-                try:
-                    r_prev = requests.post(
-                        f"{Q}/delete/{job_id}", params={"dry_run": "true"},
-                        json={"request": {"questionId": qid}},
-                        headers=get_headers())
-                    if r_prev.status_code == 200:
-                        show_alerts(r_prev.json().get("alerts"))
-                except Exception:
-                    pass  # preview is a nicety; deletion is still blocked without confirm
+                # Computed locally — the impact of a deletion is knowable from the
+                # question in hand, so there is nothing to ask the server.
+                show_alerts(delete_impact(question, remaining))
 
                 c1, c2 = st.columns(2)
                 if c1.button("Cancel", key=f"del_cancel_{job_key}_{qid}", use_container_width=True):
-                    st.rerun()
+                    st.rerun()   # cancel is purely local: discard and re-render
                 if c2.button("Delete question", key=f"del_confirm_{job_key}_{qid}",
                              type="primary", use_container_width=True):
+                    # This call deletes. The confirmation was this dialog.
                     r_del = requests.post(
                         f"{Q}/delete/{job_id}",
-                        json={"request": {"questionId": qid, "confirm": True,
-                                          "version": version}},
+                        json={"request": {"questionId": qid, "version": version}},
                         headers=get_headers())
                     if r_del.status_code == 200:
-                        st.success(r_del.json().get("announcement", "Deleted"))
+                        st.success(announce_deleted(position, remaining))
                         st.rerun()
                     else:
                         show_api_error(r_del, "Delete failed")
 
-            # Load the authoritative ordered question list
+            # One read of the assessment; the ordered, annotated question list is a
+            # local projection of it. There is no /questions/list endpoint — the
+            # server holds nothing here the client does not already have.
             try:
-                r_q = requests.get(f"{Q}/list/{job_id}", headers=get_headers())
+                r_q = requests.get(f"{API_V1}/status/{job_id}", headers=get_headers())
             except Exception as e:
                 st.error(f"Could not load questions: {e}")
                 r_q = None
@@ -558,12 +568,13 @@ with tab_view:
                 show_api_error(r_q, "Could not load questions")
             elif r_q is not None:
                 q_data = r_q.json()
-                version = q_data["version"]
-                q_list = q_data["questions"]
-                q_order = q_data["question_order"]
+                version = int(q_data.get("version") or 1)
+                assessment_data = q_data.get("assessment_data") or {}
+                q_list = editor_list(assessment_data)
+                q_order = [q["question_id"] for q in q_list]
 
                 m1, m2, m3 = st.columns(3)
-                m1.metric("Questions", q_data["total_questions"])
+                m1.metric("Questions", len(q_list))
                 m2.metric("Assessment version", version)
                 if m3.button("🔄 Reload from backend"):
                     st.rerun()
@@ -600,7 +611,7 @@ with tab_view:
                         new_type = dict(QUESTION_TYPE_CHOICES)[new_type_label]
                         new_pos = a2.number_input(
                             "Position (1-based, blank = append)", min_value=0,
-                            max_value=q_data["total_questions"] + 1, value=0, key="add_pos",
+                            max_value=len(q_list) + 1, value=0, key="add_pos",
                         )
                         new_text = st.text_area("Question text / matching context", key="add_text")
                         st.caption(
@@ -726,9 +737,11 @@ with tab_view:
                                                       headers=get_headers())
                                 if r_add.status_code == 201:
                                     res = r_add.json()
+                                    total = res.get("total_questions", 0)
                                     st.success(f"Added as {res['question_id']} "
                                                f"(version {res['version']})")
-                                    show_alerts(res.get("alerts"))
+                                    st.caption(announce_added(
+                                        int(new_pos) if new_pos else total, total))
                                     st.rerun()
                                 else:
                                     show_api_error(r_add, "Add failed")
@@ -754,17 +767,23 @@ with tab_view:
                         # ---------- reorder ----------
                         rc1, rc2, rc3, rc4 = st.columns([1, 1, 2, 3])
                         def move_to(target):
+                            # The API takes one input form: the complete new sequence.
+                            # A single move is the splice that produces it, computed
+                            # here because we already hold the whole order.
+                            new_order = [x for x in q_order if x != qid]
+                            new_order.insert(
+                                max(0, min(int(target), len(q_order)) - 1), qid)
                             try:
                                 r_mv = requests.post(
                                     f"{Q}/order/{job_id}",
-                                    json={"request": {
-                                        "questionId": qid, "position": target,
-                                        "version": version}},
+                                    json={"request": {"questionOrder": new_order,
+                                                      "version": version}},
                                     headers=get_headers(),
                                 )
                                 if r_mv.status_code == 200:
                                     # Screen readers would consume this via aria-live.
-                                    st.success(r_mv.json().get("announcement", "Reordered"))
+                                    st.success(announce_reordered(
+                                        qid, pos, int(target), len(new_order)))
                                     st.rerun()
                                 else:
                                     show_api_error(r_mv, "Reorder failed")
@@ -790,7 +809,7 @@ with tab_view:
                             confirm_delete_dialog(
                                 qid, version,
                                 (q.get("question_text") or q.get("matching_context") or "").strip(),
-                                job_id,
+                                job_id, q, pos, len(q_list) - 1,
                             )
 
                         st.divider()
@@ -1098,43 +1117,43 @@ with tab_view:
                                 st.rerun()
 
                             if preview_clicked or save_clicked:
+                                pruned = prune_unchanged(updates, q)
                                 body = {"request": {
                                     "questionId": qid,
-                                    "updates": prune_unchanged(updates, q),
+                                    "updates": pruned,
                                     "version": version}}
                                 try:
                                     if preview_clicked:
-                                        # Pre-update alert, nothing is written
-                                        r_dry = requests.post(
-                                            f"{Q}/update/{job_id}",
-                                            params={"dry_run": "true"}, json=body,
-                                            headers=get_headers())
-                                        if r_dry.status_code == 200:
-                                            res = r_dry.json()
-                                            if not res.get("valid"):
-                                                st.error("This change would be rejected:")
-                                                for err in res.get("errors", []):
-                                                    st.warning(f"• `{err.get('field')}` — "
-                                                               f"{err.get('message')}")
-                                            elif not res.get("changed_fields"):
-                                                st.info("No changes to save.")
-                                            else:
-                                                st.write("**Fields that will change:**")
-                                                for c in res["changed_fields"]:
-                                                    st.write(f"• `{c['field']}`: "
-                                                             f"{c['previous_value']!r} → "
-                                                             f"{c['new_value']!r}")
-                                                show_alerts(res.get("alerts"))
+                                        # Entirely local. `q` is the before-state this
+                                        # form was seeded from and `pruned` is what the
+                                        # user typed, so the impact of the pending save
+                                        # is already fully determined here — there is
+                                        # nothing to ask the server, and no dry-run
+                                        # endpoint to ask.
+                                        diff = changed_fields(q, pruned)
+                                        if not diff:
+                                            st.info("No changes to save.")
                                         else:
-                                            show_api_error(r_dry, "Preview failed")
+                                            st.write("**Fields that will change:**")
+                                            for c in diff:
+                                                st.write(f"• `{c['field']}`: "
+                                                         f"{c['previous_value']!r} → "
+                                                         f"{c['new_value']!r}")
+                                            # Note this correctly reports a pure option
+                                            # re-sequencing as "options reordered"
+                                            # rather than "the correct answer will
+                                            # change" — see client_side.
+                                            show_alerts(impact_of(q, pruned))
                                     else:
                                         r_sv = requests.post(f"{Q}/update/{job_id}",
                                                              json=body, headers=get_headers())
                                         if r_sv.status_code == 200:
                                             res = r_sv.json()
-                                            st.success(f"{res.get('message')} "
+                                            # The response carries an outcome
+                                            # `code`, not a sentence — the
+                                            # wording is ours. See client_side.
+                                            st.success(f"{outcome_text(res)} "
                                                        f"(version {res.get('version')})")
-                                            show_alerts(res.get("alerts"))
                                             # Re-key every widget, exactly as Cancel
                                             # does. A save can change what a widget
                                             # should now display without changing the

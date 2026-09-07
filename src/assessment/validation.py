@@ -1,5 +1,5 @@
 """
-Validation gate and pre-update alerts.
+Validation gate.
 
 The validation gate blocks saving an invalid question. Nothing reaches the
 database until `validate_question` / `validate_assessment` return no errors,
@@ -13,12 +13,15 @@ applied:
     a human reviewer. See `MIN_OPTION_COUNT` / `MAX_OPTION_COUNT_ON_ADD` in
     questions.py for why the ceiling is add-only.
   * An assessment must always contain at least one question.
+
+Errors carry machine-readable facts only — `code`, `field`, `question_id` and a
+`params` bag holding every value a message needs to interpolate. They carry no
+human-readable sentence: the client owns the copy because it owns the user's
+language, and this service serves twelve of them.
 """
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .questions import (
@@ -30,7 +33,6 @@ from .questions import (
     BUCKET_MTF,
     BUCKET_MULTICHOICE,
     BUCKET_TRUEFALSE,
-    PROV_AI_GENERATED,
     VALID_PROVENANCE,
     iter_questions_in_order,
     question_count,
@@ -98,7 +100,7 @@ SERVER_OWNED_FIELDS = {"question_id", "question_type", "provenance", "position",
                        "question_bucket", "question_type_key"}
 
 # Answer-key paths — a change here is the answer-key change (Correct Answer
-# Changed) and raises a high-severity pre-update alert.
+# Changed) and is recorded as its own audit event.
 ANSWER_KEY_FIELDS = {"correct_option_index", "correct_answer", "pairs"}
 
 # Mapping paths — a change here is a mapping update (Mapping Updated).
@@ -124,9 +126,21 @@ class ValidationError(Exception):
         super().__init__(f"{len(errors)} validation error(s)")
 
 
-def _err(code: str, message: str, field: Optional[str] = None,
-         question_id: Optional[str] = None) -> Dict[str, Any]:
-    return {"code": code, "message": message, "field": field, "question_id": question_id}
+def _err(code: str, field: Optional[str] = None,
+         question_id: Optional[str] = None, **params: Any) -> Dict[str, Any]:
+    """
+    One validation failure, as machine-readable facts only.
+
+    `code` selects the message the client renders, `field` and `question_id`
+    locate it, and `params` carries every value that message needs to
+    interpolate. So a client can render "must have at least 2 options (found 1)"
+    in any language from `{"code": "option_count_invalid", "params":
+    {"minimum": 2, "found": 1}}` — without this module knowing English.
+    """
+    error: Dict[str, Any] = {"code": code, "field": field, "question_id": question_id}
+    if params:
+        error["params"] = params
+    return error
 
 
 def get_path(obj: Any, path: str) -> Any:
@@ -185,13 +199,10 @@ def validate_question(
     # --- text ---------------------------------------------------------
     if bucket == BUCKET_MTF:
         if _is_blank(question.get("matching_context")):
-            errors.append(_err("matching_context_required",
-                               "Match-the-Following questions require a matching context.",
-                               "matching_context", qid))
+            errors.append(_err("matching_context_required", "matching_context", qid))
     else:
         if _is_blank(question.get("question_text")):
-            errors.append(_err("question_text_required",
-                               "Question text cannot be empty.", "question_text", qid))
+            errors.append(_err("question_text_required", "question_text", qid))
 
     # --- options and answer key --------------------------------------
     if bucket in (BUCKET_MCQ, BUCKET_MULTICHOICE):
@@ -199,54 +210,45 @@ def validate_question(
                                         enforce_ceiling=is_new_question))
     elif bucket == BUCKET_FTB:
         if _is_blank(question.get("correct_answer")):
-            errors.append(_err("correct_answer_required",
-                               "Fill-in-the-Blank questions require a correct answer.",
-                               "correct_answer", qid))
+            errors.append(_err("correct_answer_required", "correct_answer", qid))
     elif bucket == BUCKET_TRUEFALSE:
         if str(question.get("correct_answer")) not in ("True", "False"):
-            errors.append(_err("correct_answer_invalid",
-                               'True/False questions require a correct answer of "True" or "False".',
-                               "correct_answer", qid))
+            errors.append(_err("correct_answer_invalid", "correct_answer", qid,
+                               allowed=["True", "False"]))
     elif bucket == BUCKET_MTF:
         errors.extend(_validate_pairs(question, qid))
 
     # --- rationale -----------------------------------------------------
     if _is_blank(get_path(question, "answer_rationale.correct_answer_explanation")):
         errors.append(_err("rationale_required",
-                           "An answer rationale (correct answer explanation) is required.",
                            "answer_rationale.correct_answer_explanation", qid))
 
     # --- Bloom's level ---------------------------------------------
     blooms = question.get("blooms_level")
     if enable_blooms and _is_blank(blooms):
-        errors.append(_err("blooms_level_required",
-                           "A Bloom's level is required while Bloom's taxonomy is enabled.",
-                           "blooms_level", qid))
+        errors.append(_err("blooms_level_required", "blooms_level", qid))
     elif not _is_blank(blooms) and str(blooms).strip().capitalize() not in BLOOMS_LEVELS:
-        errors.append(_err("blooms_level_invalid",
-                           f"Bloom's level must be one of: {', '.join(BLOOMS_LEVELS)}.",
-                           "blooms_level", qid))
+        errors.append(_err("blooms_level_invalid", "blooms_level", qid,
+                           allowed=list(BLOOMS_LEVELS), found=blooms))
 
     # --- relevance -----------------------------------------------------
     relevance = question.get("relevance_percentage")
     if relevance is None:
-        errors.append(_err("relevance_required", "Relevance percentage is required.",
-                           "relevance_percentage", qid))
+        errors.append(_err("relevance_required", "relevance_percentage", qid))
     else:
         try:
             value = int(relevance)
             if not 0 <= value <= 100:
                 raise ValueError
         except (TypeError, ValueError):
-            errors.append(_err("relevance_invalid",
-                               "Relevance percentage must be an integer between 0 and 100.",
-                               "relevance_percentage", qid))
+            errors.append(_err("relevance_invalid", "relevance_percentage", qid,
+                               minimum=0, maximum=100, found=relevance))
 
     # --- provenance ------------------------------------------------
     if question.get("provenance") not in VALID_PROVENANCE:
-        errors.append(_err("provenance_invalid",
-                           f"Provenance must be one of: {', '.join(sorted(VALID_PROVENANCE))}.",
-                           "provenance", qid))
+        errors.append(_err("provenance_invalid", "provenance", qid,
+                           allowed=sorted(VALID_PROVENANCE),
+                           found=question.get("provenance")))
 
     # --- mapping ---------------------------------------------------
     errors.extend(validate_mapping(question, edited_paths=edited_paths))
@@ -261,7 +263,7 @@ def _validate_options(bucket: str, question: Dict[str, Any],
     options = question.get("options")
 
     if not isinstance(options, list):
-        return [_err("options_required", "Options must be a list.", "options", qid)]
+        return [_err("options_required", "options", qid)]
 
     # The floor always applies; the ceiling only when the question is being
     # authored. `ceiling is None` therefore covers both a bucket with no ceiling
@@ -269,78 +271,63 @@ def _validate_options(bucket: str, question: Dict[str, Any],
     count = len(options)
     ceiling = MAX_OPTION_COUNT_ON_ADD.get(bucket) if enforce_ceiling else None
     if count < MIN_OPTION_COUNT or (ceiling is not None and count > ceiling):
-        if ceiling is None:
-            expected = f"at least {MIN_OPTION_COUNT}"
-        elif ceiling == MIN_OPTION_COUNT:
-            expected = f"exactly {ceiling}"
-        else:
-            expected = f"between {MIN_OPTION_COUNT} and {ceiling}"
         errors.append(_err(
-            "option_count_invalid",
-            f"This question type must have {expected} options (found {count}).",
-            "options", qid,
+            "option_count_invalid", "options", qid,
+            minimum=MIN_OPTION_COUNT, maximum=ceiling, found=count,
         ))
 
     indexes: List[int] = []
     for i, option in enumerate(options):
         if not isinstance(option, dict):
-            errors.append(_err("option_malformed",
-                               f"Option {i + 1} must be an object with a text and index.",
-                               f"options.{i}", qid))
+            errors.append(_err("option_malformed", f"options.{i}", qid, option_position=i + 1))
             continue
         if _is_blank(option.get("text")):
-            errors.append(_err("option_text_required", f"Option {i + 1} text cannot be empty.",
-                               f"options.{i}.text", qid))
+            errors.append(_err("option_text_required", f"options.{i}.text", qid,
+                               option_position=i + 1))
         try:
             indexes.append(int(option["index"]))
         except (KeyError, TypeError, ValueError):
-            errors.append(_err("option_index_invalid",
-                               f"Option {i + 1} requires an integer index.",
-                               f"options.{i}.index", qid))
+            errors.append(_err("option_index_invalid", f"options.{i}.index", qid,
+                               option_position=i + 1))
 
     if len(set(indexes)) != len(indexes):
-        errors.append(_err("option_index_duplicate", "Option indexes must be unique.",
-                           "options", qid))
+        errors.append(_err("option_index_duplicate", "options", qid))
 
     valid_indexes = set(indexes)
     correct = question.get("correct_option_index")
 
     if bucket == BUCKET_MCQ:
         if isinstance(correct, list):
-            errors.append(_err("correct_option_index_invalid",
-                               "A single-select MCQ requires exactly one correct option index.",
-                               "correct_option_index", qid))
+            errors.append(_err("correct_option_index_invalid", "correct_option_index", qid,
+                               expects="single_index"))
         elif correct is None:
-            errors.append(_err("correct_option_index_required",
-                               "A correct option must be selected.", "correct_option_index", qid))
+            errors.append(_err("correct_option_index_required", "correct_option_index", qid))
         else:
             try:
                 if int(correct) not in valid_indexes:
                     raise ValueError
             except (TypeError, ValueError):
                 errors.append(_err("correct_option_index_out_of_range",
-                                   "The correct option index does not match any option.",
-                                   "correct_option_index", qid))
+                                   "correct_option_index", qid,
+                                   found=correct, valid_indexes=sorted(valid_indexes)))
     else:  # BUCKET_MULTICHOICE
         if not isinstance(correct, list) or not correct:
-            errors.append(_err("correct_option_index_required",
-                               "A multiple-select question requires at least one correct option.",
-                               "correct_option_index", qid))
+            errors.append(_err("correct_option_index_required", "correct_option_index", qid,
+                               expects="index_array"))
         else:
             try:
                 chosen = {int(x) for x in correct}
             except (TypeError, ValueError):
-                errors.append(_err("correct_option_index_invalid",
-                                   "Correct option indexes must be integers.",
-                                   "correct_option_index", qid))
+                errors.append(_err("correct_option_index_invalid", "correct_option_index", qid,
+                                   expects="index_array"))
                 return errors
             if not chosen <= valid_indexes:
                 errors.append(_err("correct_option_index_out_of_range",
-                                   "One or more correct option indexes do not match any option.",
-                                   "correct_option_index", qid))
+                                   "correct_option_index", qid,
+                                   found=sorted(chosen),
+                                   valid_indexes=sorted(valid_indexes)))
             if len(chosen) != len(correct):
                 errors.append(_err("correct_option_index_duplicate",
-                                   "Correct option indexes must not repeat.",
                                    "correct_option_index", qid))
 
     return errors
@@ -349,51 +336,6 @@ def _validate_options(bucket: str, question: Dict[str, Any],
 # --------------------------------------------------------------------------
 # Mapping validation
 # --------------------------------------------------------------------------
-# The KCM vocabulary lives in resources/competencies.json as
-#   [{name, competency_theme: [{name, competency_sub_theme: [...]}]}]
-
-def _load_kcm_index() -> Dict[str, Dict[str, set]]:
-    """
-    area -> theme -> {sub-themes}, all lower-cased for comparison.
-
-    Read straight from the resource file rather than through `generator.py`,
-    which imports google-genai — the API process must never pull that in.
-    """
-    path = Path(__file__).parent / "resources" / "competencies.json"
-    if not path.exists():
-        return {}
-    with open(path, "r", encoding="utf-8") as handle:
-        dataset = json.load(handle)
-
-    index: Dict[str, Dict[str, set]] = {}
-    for area in dataset or []:
-        if not isinstance(area, dict):
-            continue
-        area_name = str(area.get("name", "")).strip().lower()
-        themes: Dict[str, set] = {}
-        for theme in area.get("competency_theme") or []:
-            if not isinstance(theme, dict):
-                continue
-            theme_name = str(theme.get("name", "")).strip().lower()
-            themes[theme_name] = {
-                str(s).strip().lower() for s in (theme.get("competency_sub_theme") or [])
-            }
-        index[area_name] = themes
-    return index
-
-
-_KCM_INDEX: Optional[Dict[str, Dict[str, set]]] = None
-
-
-def kcm_index() -> Dict[str, Dict[str, set]]:
-    global _KCM_INDEX
-    if _KCM_INDEX is None:
-        try:
-            _KCM_INDEX = _load_kcm_index()
-        except Exception:  # pragma: no cover — never block a save on a load failure
-            _KCM_INDEX = {}
-    return _KCM_INDEX
-
 
 def validate_mapping(
     question: Dict[str, Any],
@@ -404,17 +346,11 @@ def validate_mapping(
     Mapping validation — "Mapping validation must run before save", and the
     mapping-validation limb of the validation gate.
 
-    Two tiers, deliberately:
-
-    * **Structural** rules always apply to a saved question — a mapping field
-      cannot be blanked out, and the KCM triple is all-or-nothing, because a
-      partial area/theme/sub-theme is not a usable mapping.
-    * **Vocabulary** rules — that the triple actually exists in
-      resources/competencies.json — apply only when the reviewer edits one of
-      the KCM fields. Generated questions occasionally carry a label that is not
-      an exact match for the dataset, and checking the vocabulary on every save
-      would make an unrelated wording fix impossible on those questions. Once a
-      reviewer touches the mapping, they are expected to land on a real one.
+    Structural rules only: a mapping field cannot be blanked out once edited,
+    and the KCM triple is all-or-nothing, because a partial area/theme/
+    sub-theme is not a usable mapping. The triple's values are free text and
+    are not checked against resources/competencies.json — a reviewer (or the
+    generator) may record any area/theme/sub-theme label.
     """
     qid = question.get("question_id")
     errors: List[Dict[str, Any]] = []
@@ -428,48 +364,19 @@ def validate_mapping(
     # --- structural ---------------------------------------------------
     for path in (LEARNING_OUTCOME_FIELD, "course_name"):
         if path in edited and _is_blank(get_path(question, path)):
-            errors.append(_err(
-                "mapping_required",
-                f"'{path}' cannot be blank once it is mapped.", path, qid))
+            errors.append(_err("mapping_required", path, qid))
 
     present = [bool(area), bool(theme), bool(sub_theme)]
     if any(present) and not all(present):
-        errors.append(_err(
-            "competency_mapping_incomplete",
-            "A competency mapping requires all three of area, theme and sub-theme.",
-            "reasoning.competency_alignment.kcm", qid))
-        return errors
-
-    # --- vocabulary, only when the mapping itself was edited -----------
-    if not (edited & set(KCM_FIELDS)) or not all(present):
-        return errors
-
-    index = kcm_index()
-    if not index:
-        return errors
-
-    themes = index.get(area.lower())
-    if themes is None:
-        errors.append(_err(
-            "competency_area_unknown",
-            f"'{area}' is not a known competency area. "
-            f"Valid areas: {', '.join(sorted(a.title() for a in index))}.",
-            KCM_AREA_FIELD, qid))
-        return errors
-
-    sub_themes = themes.get(theme.lower())
-    if sub_themes is None:
-        errors.append(_err(
-            "competency_theme_unknown",
-            f"'{theme}' is not a known competency theme for area '{area}'.",
-            KCM_THEME_FIELD, qid))
-        return errors
-
-    if sub_theme.lower() not in sub_themes:
-        errors.append(_err(
-            "competency_sub_theme_unknown",
-            f"'{sub_theme}' is not a known sub-theme for theme '{theme}'.",
-            KCM_SUB_THEME_FIELD, qid))
+        errors.append(_err("competency_mapping_incomplete",
+                           "reasoning.competency_alignment.kcm", qid,
+                           missing=[
+                               name for name, ok in (
+                                   ("competency_area", bool(area)),
+                                   ("competency_theme", bool(theme)),
+                                   ("competency_sub_theme", bool(sub_theme)),
+                               ) if not ok
+                           ]))
 
     return errors
 
@@ -478,22 +385,20 @@ def _validate_pairs(question: Dict[str, Any], qid: Optional[str]) -> List[Dict[s
     errors: List[Dict[str, Any]] = []
     pairs = question.get("pairs")
     if not isinstance(pairs, list):
-        return [_err("pairs_required", "Pairs must be a list.", "pairs", qid)]
+        return [_err("pairs_required", "pairs", qid)]
     if len(pairs) < MIN_MTF_PAIRS:
-        errors.append(_err("pair_count_invalid",
-                           f"Match-the-Following requires at least {MIN_MTF_PAIRS} pairs "
-                           f"(found {len(pairs)}).", "pairs", qid))
+        errors.append(_err("pair_count_invalid", "pairs", qid,
+                           minimum=MIN_MTF_PAIRS, found=len(pairs)))
     for i, pair in enumerate(pairs):
         if not isinstance(pair, dict):
-            errors.append(_err("pair_malformed", f"Pair {i + 1} must be an object.",
-                               f"pairs.{i}", qid))
+            errors.append(_err("pair_malformed", f"pairs.{i}", qid, pair_position=i + 1))
             continue
         if _is_blank(pair.get("left")):
-            errors.append(_err("pair_left_required", f"Pair {i + 1} left value cannot be empty.",
-                               f"pairs.{i}.left", qid))
+            errors.append(_err("pair_left_required", f"pairs.{i}.left", qid,
+                               pair_position=i + 1))
         if _is_blank(pair.get("right")):
-            errors.append(_err("pair_right_required", f"Pair {i + 1} right value cannot be empty.",
-                               f"pairs.{i}.right", qid))
+            errors.append(_err("pair_right_required", f"pairs.{i}.right", qid,
+                               pair_position=i + 1))
     return errors
 
 
@@ -534,18 +439,15 @@ def validate_assessment(
     errors: List[Dict[str, Any]] = []
 
     if question_count(assessment_data) < 1:
-        errors.append(_err("assessment_empty",
-                           "An assessment must contain at least one question.", "questions"))
+        errors.append(_err("assessment_empty", "questions"))
 
     seen: set = set()
     for bucket, question in iter_questions_in_order(assessment_data):
         qid = str(question.get("question_id") or "")
         if not qid:
-            errors.append(_err("question_id_required", "Every question requires an identifier.",
-                               "question_id"))
+            errors.append(_err("question_id_required", "question_id"))
         elif qid in seen:
-            errors.append(_err("question_id_duplicate",
-                               f"Duplicate question identifier: {qid}.", "question_id", qid))
+            errors.append(_err("question_id_duplicate", "question_id", qid))
         else:
             seen.add(qid)
 
@@ -567,66 +469,19 @@ def validate_editable_fields(bucket: str, updates: Dict[str, Any]) -> List[Dict[
     """
     allowed = EDITABLE_FIELDS.get(bucket, set())
     return [
-        _err("field_not_editable",
-             f"'{path}' is not an editable field for {bucket}. "
-             f"Editable fields: {', '.join(sorted(allowed))}.", path)
+        _err("field_not_editable", path, None,
+             question_bucket=bucket, editable_fields=sorted(allowed))
         for path in updates
         if path not in allowed and path not in SERVER_OWNED_FIELDS
     ]
 
 
 # --------------------------------------------------------------------------
-# Pre-update alerts
+# Option-change classification
 # --------------------------------------------------------------------------
-# The source specification requires an alert before an update is applied but
-# does not define its trigger conditions, content or severity. These are the
-# conditions implemented here; the client renders them as the pre-update alert
-# and may show them via `dry_run=true` before committing the save.
-
-_ALERT_LABELS = {
-    "correct_option_index": ("answer_key_changed", "high",
-                            "The correct answer for this question will change."),
-    "correct_answer": ("answer_key_changed", "high",
-                       "The correct answer for this question will change."),
-    "pairs": ("answer_key_changed", "high",
-              "The matching pairs — and therefore the answer key — will change."),
-    "options": ("options_changed", "high",
-                "The answer options for this question will change."),
-    "question_text": ("question_text_changed", "medium",
-                      "The question text will change."),
-    "matching_context": ("question_text_changed", "medium",
-                         "The matching context will change."),
-    "course_name": ("course_mapping_changed", "medium",
-                    "The course this question is mapped to will change."),
-    "blooms_level": ("blooms_level_changed", "low",
-                     "The Bloom's level for this question will change."),
-    "relevance_percentage": ("relevance_changed", "low",
-                             "The relevance percentage for this question will change."),
-}
-
-# Used in place of the entries above when the options were only re-sequenced
-# — see `classify_option_change`.
-_REORDER_LABELS = {
-    "options": ("options_reordered", "medium",
-                "The answer options will be shown in a new order. Their wording "
-                "is unchanged."),
-    "correct_option_index": ("answer_key_reindexed", "medium",
-                             "The correct option itself is unchanged; its index "
-                             "moves to follow the new option order."),
-}
-
-_ALERT_PREFIX_LABELS = [
-    ("reasoning.competency_alignment", ("competency_mapping_changed", "medium",
-                                       "The competency mapping for this question will change.")),
-    ("reasoning.learning_objective_alignment", ("learning_outcome_changed", "medium",
-                                                "The learning outcome mapping will change.")),
-    ("answer_rationale", ("rationale_changed", "low", "The answer rationale will change.")),
-]
-
-
-def _alert(code: str, severity: str, message: str, **extra: Any) -> Dict[str, Any]:
-    return {"code": code, "severity": severity, "message": message, **extra}
-
+# Retained server-side because the **audit trail** records it: an
+# `options_reordered` / `reindexed_only` flag on the Question Edit Saved and
+# Correct Answer Changed events (see editing.py). It is not presentation.
 
 def _option_texts(options: Any) -> Optional[Dict[int, str]]:
     """`{index: text}` for a well-formed option list, or None if it is not one."""
@@ -661,9 +516,9 @@ def classify_option_change(
     Tell a pure re-sequencing of the options apart from a genuine content edit.
 
     Reordering the options renumbers them, so `correct_option_index` changes on
-    every reorder even though the option it points at does not. Reported as-is
-    that reads "the correct answer for this question will change", which is
-    wrong and is the one thing a reviewer must be able to trust the alert about.
+    every reorder even though the option it points at does not. Recorded as-is
+    the audit trail would read as a reviewer changing the answer key, which is
+    the one thing an audit of an assessment must not get wrong.
 
     Returns `(options_reordered, answer_reindexed)`:
       * `options_reordered` — the same option texts, in a different order
@@ -701,72 +556,3 @@ def classify_option_change(
     reindexed = (sorted(previous[i] for i in before_key)
                  == sorted(current[i] for i in after_key))
     return True, reindexed
-
-
-def build_change_alerts(
-    bucket: str,
-    before: Dict[str, Any],
-    changed_fields: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """
-    Describe the impact of a pending edit so the client can show the
-    pre-update alert. `changed_fields` is the diff produced by `editing.py`.
-    """
-    alerts: List[Dict[str, Any]] = []
-    emitted: set = set()
-
-    # A reorder of the options and the index shift it forces on the answer key
-    # are described in their own terms, so they are not mistaken for a change to
-    # the option wording or to which option is correct.
-    options_reordered, answer_reindexed = classify_option_change(changed_fields)
-
-    for change in changed_fields:
-        path = change["field"]
-        label = _REORDER_LABELS.get(path) if (
-            (path == "options" and options_reordered)
-            or (path == "correct_option_index" and answer_reindexed)
-        ) else _ALERT_LABELS.get(path)
-        if label is None:
-            for prefix, prefix_label in _ALERT_PREFIX_LABELS:
-                if path == prefix or path.startswith(prefix + "."):
-                    label = prefix_label
-                    break
-        if label is None:
-            continue
-        code, severity, message = label
-        if code in emitted:
-            continue
-        emitted.add(code)
-        alerts.append(_alert(code, severity, message, field=path))
-
-    # An edited AI question becomes AI-assisted, not human-authored.
-    if changed_fields and before.get("provenance") == PROV_AI_GENERATED:
-        alerts.append(_alert(
-            "provenance_will_change", "info",
-            "This AI-generated question will be recorded as AI-assisted once saved.",
-        ))
-
-    if changed_fields:
-        alerts.append(_alert(
-            "authoritative_version", "info",
-            "Saving replaces the authoritative assessment version used for all "
-            "downloads and publication.",
-        ))
-
-    return alerts
-
-
-def build_delete_alerts(bucket: str, question: Dict[str, Any],
-                        remaining: int) -> List[Dict[str, Any]]:
-    """Impact of a pending deletion."""
-    alerts = [_alert(
-        "question_will_be_deleted", "high",
-        "This question will be permanently removed from the assessment.",
-        question_id=question.get("question_id"),
-    )]
-    if remaining <= 0:
-        alerts.append(_alert(
-            "last_question", "high",
-            "This is the only question in the assessment and cannot be deleted.",
-        ))
-    return alerts
