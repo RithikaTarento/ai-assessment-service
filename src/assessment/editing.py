@@ -25,7 +25,6 @@ import copy
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import telemetry
 from .questions import (
     PROV_AI_ASSISTED,
     PROV_AI_GENERATED,
@@ -56,12 +55,37 @@ from .validation import (
 )
 
 
+# --------------------------------------------------------------------------
+# Audit event codes
+# --------------------------------------------------------------------------
+# Every change an editing operation makes is recorded as one audit row, and the
+# code below says which kind of change it was. The code strings are stored
+# verbatim in `interactive_assessment_audit.event_code`, so they stay as they
+# are for the sake of rows that have already been written.
+
+AUDIT_QUESTION_EDIT_SAVED = "TEL-03"
+AUDIT_QUESTION_ADDED = "TEL-05"
+AUDIT_QUESTION_DELETED = "TEL-06"
+AUDIT_QUESTION_REORDERED = "TEL-07"
+AUDIT_CORRECT_ANSWER_CHANGED = "TEL-10"
+AUDIT_MAPPING_UPDATED = "TEL-11"
+
+AUDIT_EVENT_NAMES: Dict[str, str] = {
+    AUDIT_QUESTION_EDIT_SAVED: "Question Edit Saved",
+    AUDIT_QUESTION_ADDED: "Question Added",
+    AUDIT_QUESTION_DELETED: "Question Deleted",
+    AUDIT_QUESTION_REORDERED: "Question Reordered",
+    AUDIT_CORRECT_ANSWER_CHANGED: "Correct Answer Changed",
+    AUDIT_MAPPING_UPDATED: "Mapping Updated",
+}
+
+
 @dataclass
 class EditResult:
     """Outcome of one editing operation."""
 
     assessment_data: Dict[str, Any]
-    # Every telemetry event this operation produced, in emission order.
+    # Every audit event this operation produced, in order.
     events: List[Dict[str, Any]] = field(default_factory=list)
     alerts: List[Dict[str, Any]] = field(default_factory=list)
     question: Optional[Dict[str, Any]] = None
@@ -70,12 +94,11 @@ class EditResult:
     @property
     def audit_rows(self) -> List[Dict[str, Any]]:
         """
-        The subset of events that is persisted to the audit trail — exactly
-        six feeds: Question Edit Saved, Question Added, Question Deleted,
-        Question Reordered, Correct Answer Changed and Mapping Updated — so
-        Option Added and Option Deleted are observability-only.
+        The events that are persisted to the audit trail — exactly six feeds:
+        Question Edit Saved, Question Added, Question Deleted, Question
+        Reordered, Correct Answer Changed and Mapping Updated.
         """
-        return [e for e in self.events if e["event_code"] in telemetry.AUDITED_EVENTS]
+        return [e for e in self.events if e["event_code"] in AUDIT_EVENT_NAMES]
 
     @property
     def changed(self) -> bool:
@@ -97,7 +120,7 @@ def _event(
 ) -> Dict[str, Any]:
     return {
         "event_code": event_code,
-        "event_name": telemetry.EVENT_NAMES.get(event_code, event_code),
+        "event_name": AUDIT_EVENT_NAMES.get(event_code, event_code),
         "editor_id": editor_id,
         "question_id": question_id,
         "question_type": question_type,
@@ -229,7 +252,7 @@ def apply_question_edit(
     # Question Edit Saved — the umbrella event, carrying the changed
     # fields with their previous and new values.
     events: List[Dict[str, Any]] = [_event(
-        telemetry.TEL_QUESTION_EDIT_SAVED,
+        AUDIT_QUESTION_EDIT_SAVED,
         editor_id=editor_id,
         question_id=question_id,
         question_type=q_type_key,
@@ -247,37 +270,12 @@ def apply_question_edit(
         },
     )]
 
-    # Option Added / Deleted. Option add and remove are
-    # expressed as a full replacement of the option list, so the count decides
-    # which event it was. `pairs` is the MTF equivalent of options.
-    for field_name in ("options", "pairs"):
-        change = next((c for c in changed_fields if c["field"] == field_name), None)
-        if change is None:
-            continue
-        before_count = len(change["previous_value"] or []) \
-            if isinstance(change["previous_value"], list) else 0
-        after_count = len(change["new_value"] or []) \
-            if isinstance(change["new_value"], list) else 0
-        if after_count == before_count:
-            continue
-        code = (telemetry.TEL_OPTION_ADDED if after_count > before_count
-                else telemetry.TEL_OPTION_DELETED)
-        events.append(_event(
-            code,
-            editor_id=editor_id,
-            question_id=question_id,
-            question_type=q_type_key,
-            details={"field": field_name,
-                     "previous_option_count": before_count,
-                     "new_option_count": after_count},
-        ))
-
     # Correct Answer Changed — carries the previous and updated
     # answer, and feeds the audit trail in its own right.
     if answer_key_changed:
         answer_change = next(c for c in changed_fields if c["field"] in ANSWER_KEY_FIELDS)
         events.append(_event(
-            telemetry.TEL_CORRECT_ANSWER_CHANGED,
+            AUDIT_CORRECT_ANSWER_CHANGED,
             editor_id=editor_id,
             question_id=question_id,
             question_type=q_type_key,
@@ -295,7 +293,7 @@ def apply_question_edit(
     # audit feed in its own right.
     if mapping_changed:
         events.append(_event(
-            telemetry.TEL_MAPPING_UPDATED,
+            AUDIT_MAPPING_UPDATED,
             editor_id=editor_id,
             question_id=question_id,
             question_type=q_type_key,
@@ -341,7 +339,7 @@ def preview_question_edit(
         "alerts": result.alerts,
         "changed_fields": next(
             (e["changed_fields"] for e in result.events
-             if e["event_code"] == telemetry.TEL_QUESTION_EDIT_SAVED), []),
+             if e["event_code"] == AUDIT_QUESTION_EDIT_SAVED), []),
         "question": result.question,
     }
 
@@ -424,7 +422,7 @@ def apply_question_add(
         bucket, stored, enable_blooms=enable_blooms, is_new_question=True))
 
     events = [_event(
-        telemetry.TEL_QUESTION_ADDED,
+        AUDIT_QUESTION_ADDED,
         editor_id=editor_id,
         question_id=stored["question_id"],
         question_type=TYPE_KEY_BY_BUCKET.get(bucket, bucket),
@@ -499,7 +497,7 @@ def apply_question_delete(
     data["question_order"] = [q for q in data["question_order"] if str(q) != str(question_id)]
 
     events = [_event(
-        telemetry.TEL_QUESTION_DELETED,
+        AUDIT_QUESTION_DELETED,
         editor_id=editor_id,
         question_id=question_id,
         question_type=TYPE_KEY_BY_BUCKET.get(bucket, bucket),
@@ -635,7 +633,7 @@ def apply_question_reorder(
         entry = index.get(qid)
         bucket = entry[0] if entry else None
         events.append(_event(
-            telemetry.TEL_QUESTION_REORDERED,
+            AUDIT_QUESTION_REORDERED,
             editor_id=editor_id,
             question_id=qid,
             question_type=TYPE_KEY_BY_BUCKET.get(bucket, bucket) if bucket else None,
@@ -698,7 +696,7 @@ def diff_assessments(
             continue
         bucket, _, question = old_index[qid]
         events.append(_event(
-            telemetry.TEL_QUESTION_DELETED,
+            AUDIT_QUESTION_DELETED,
             editor_id=editor_id,
             question_id=qid,
             question_type=TYPE_KEY_BY_BUCKET.get(bucket, bucket),
@@ -716,7 +714,7 @@ def diff_assessments(
         # matter what provenance the client claimed for it.
         question["provenance"] = PROV_HUMAN_AUTHORED
         events.append(_event(
-            telemetry.TEL_QUESTION_ADDED,
+            AUDIT_QUESTION_ADDED,
             editor_id=editor_id,
             question_id=qid,
             question_type=TYPE_KEY_BY_BUCKET.get(bucket, bucket),
@@ -764,7 +762,7 @@ def diff_assessments(
         options_reordered, answer_reindexed = classify_option_change(changed_fields)
 
         events.append(_event(
-            telemetry.TEL_QUESTION_EDIT_SAVED,
+            AUDIT_QUESTION_EDIT_SAVED,
             editor_id=editor_id,
             question_id=qid,
             question_type=TYPE_KEY_BY_BUCKET.get(bucket, bucket),
@@ -789,7 +787,7 @@ def diff_assessments(
             answer_change = next(
                 c for c in changed_fields if c["field"] in ANSWER_KEY_FIELDS)
             events.append(_event(
-                telemetry.TEL_CORRECT_ANSWER_CHANGED,
+                AUDIT_CORRECT_ANSWER_CHANGED,
                 editor_id=editor_id,
                 question_id=qid,
                 question_type=TYPE_KEY_BY_BUCKET.get(bucket, bucket),
@@ -807,7 +805,7 @@ def diff_assessments(
         # Mapping Updated — an audit feed in its own right.
         if mapping_changed:
             events.append(_event(
-                telemetry.TEL_MAPPING_UPDATED,
+                AUDIT_MAPPING_UPDATED,
                 editor_id=editor_id,
                 question_id=qid,
                 question_type=TYPE_KEY_BY_BUCKET.get(bucket, bucket),
@@ -836,7 +834,7 @@ def diff_assessments(
                 continue
             bucket = new_index[qid][0]
             events.append(_event(
-                telemetry.TEL_QUESTION_REORDERED,
+                AUDIT_QUESTION_REORDERED,
                 editor_id=editor_id,
                 question_id=qid,
                 question_type=TYPE_KEY_BY_BUCKET.get(bucket, bucket),

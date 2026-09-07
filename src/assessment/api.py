@@ -21,10 +21,10 @@ from .exporters import generate_pdf, generate_docx
 from .cleanup import start_cleanup_scheduler, stop_cleanup_scheduler
 from .events import stop_kafka_producer, send_request_event
 from .exporters_csv_v2 import generate_csv_v2, generate_csv_basic
-from . import telemetry
 from .questions import normalize_assessment, ordered_questions, question_count
 from .validation import ValidationError, validate_assessment
 from .editing import (
+    AUDIT_QUESTION_ADDED, AUDIT_QUESTION_EDIT_SAVED,
     EditResult, apply_question_add, apply_question_delete, apply_question_edit,
     apply_question_reorder, diff_assessments, preview_question_delete,
     preview_question_edit,
@@ -679,8 +679,7 @@ async def _commit(
     question_id: Optional[str] = None,
 ) -> int:
     """
-    Persist an editing result and its audit trail, then emit
-    telemetry (Save Failed / Save Successful plus the per-change events).
+    Persist an editing result and its audit trail.
 
     Success is only reported after the database confirms the write, which is
     what lets the client show "Saved successfully" truthfully.
@@ -703,58 +702,13 @@ async def _commit(
             f"[{job_id}] {operation} rejected — version conflict | "
             f"expected={expected_version} | current={current_version} | user={user_id}"
         )
-        telemetry.emit(telemetry.build_event(
-            telemetry.TEL_SAVE_FAILED, job_id=job_id, editor_id=user_id,
-            assessment_version=expected_version, operation=operation,
-            question_id=question_id, reason="version_conflict", api_status=409,
-        ))
         raise _Conflict(current_version)
 
     logger.info(
         f"[{job_id}] {operation} saved | version={new_version} | "
-        f"events={len(result.events)} | audit_rows={len(audit_rows)} | user={user_id}"
+        f"audit_rows={len(audit_rows)} | user={user_id}"
     )
-    # Emit every event the operation produced. The audit table holds only the
-    # six audit feeds; telemetry sees them all, Option Added / Option Deleted included.
-    telemetry.emit_change_events(
-        result.events, job_id=job_id, editor_id=user_id,
-        assessment_version=new_version,
-    )
-    telemetry.emit(telemetry.build_event(
-        telemetry.TEL_SAVE_SUCCESSFUL, job_id=job_id, editor_id=user_id,
-        assessment_version=new_version, operation=operation,
-        question_id=question_id,
-        question_count=question_count(result.assessment_data),
-    ))
     return new_version
-
-
-def _emit_validation_failure(job_id: str, user_id: str, row: Dict,
-                             operation: str, errors: List[Dict],
-                             question_id: Optional[str] = None) -> None:
-    """
-    Validation Failed — a blocked save is observable, which is
-    what the validation-failure-rate metric is built on.
-
-    Also emits Save Failed, so every attempted save that did not
-    persist — whether blocked by validation or lost to a version conflict —
-    lands in the same save-failure-rate bucket. Validation Failed keeps firing
-    alongside it so the validation-specific breakdown is not lost.
-    """
-    resolved_question_id = question_id or (errors[0].get("question_id") if errors else None)
-    assessment_version = int(row.get("version") or 1)
-    telemetry.emit(telemetry.build_event(
-        telemetry.TEL_VALIDATION_FAILED, job_id=job_id, editor_id=user_id,
-        assessment_version=assessment_version, operation=operation,
-        question_id=resolved_question_id,
-        validation_errors=[{"code": e.get("code"), "field": e.get("field")}
-                           for e in errors],
-    ))
-    telemetry.emit(telemetry.build_event(
-        telemetry.TEL_SAVE_FAILED, job_id=job_id, editor_id=user_id,
-        assessment_version=assessment_version, operation=operation,
-        question_id=resolved_question_id, reason="validation_failed", api_status=400,
-    ))
 
 
 def _saved_payload(job_id: str, version: int, data: Dict, result) -> Dict:
@@ -857,8 +811,6 @@ async def edit_question_v1(
     except ValidationError as exc:
         if any(e["code"] == "question_not_found" for e in exc.errors):
             return _validation_response(exc.errors, status_code=404)
-        _emit_validation_failure(job_id, user_id, row, "edit_question", exc.errors,
-                                 question_id=question_id)
         logger.info(f"[{job_id}] Edit blocked by validation | question={question_id} | "
                     f"errors={[e['code'] for e in exc.errors]}")
         return _validation_response(exc.errors)
@@ -919,7 +871,6 @@ async def add_question_v1(
             editor_id=user_id, position=body.position, enable_blooms=enable_blooms,
         )
     except ValidationError as exc:
-        _emit_validation_failure(job_id, user_id, row, "add_question", exc.errors)
         logger.info(f"[{job_id}] Add blocked by validation | "
                     f"errors={[e['code'] for e in exc.errors]}")
         return _validation_response(exc.errors)
@@ -1007,8 +958,6 @@ async def delete_question_v1(
         codes = {e["code"] for e in exc.errors}
         if "question_not_found" in codes:
             return _validation_response(exc.errors, status_code=404)
-        _emit_validation_failure(job_id, user_id, row, "delete_question", exc.errors,
-                                 question_id=question_id)
         logger.info(f"[{job_id}] Delete blocked | question={question_id} | codes={codes}")
         return _validation_response(exc.errors)
 
@@ -1062,7 +1011,6 @@ async def reorder_questions_v1(
             position=body.position,
         )
     except ValidationError as exc:
-        _emit_validation_failure(job_id, user_id, row, "reorder_questions", exc.errors)
         logger.info(f"[{job_id}] Reorder blocked | "
                     f"errors={[e['code'] for e in exc.errors]}")
         return _validation_response(exc.errors)
@@ -1085,97 +1033,6 @@ async def reorder_questions_v1(
         return _conflict_response(job_id, conflict.current_version)
 
     return _saved_payload(job_id, version, result.assessment_data, result)
-
-
-class TelemetryEventBody(_EnvelopeBody):
-    event_code: str = Field(
-        ..., alias="eventCode",
-        description="Assessment Edit Opened · Question Edit Started · "
-                    "Question Edit Cancelled · Assessment Reopened",
-    )
-    question_id: Optional[str] = Field(
-        None, alias="questionId", description="Required for Question Edit Started and Question Edit Cancelled."
-    )
-    question_type: Optional[str] = Field(None, alias="questionType")
-    question_position: Optional[int] = Field(None, alias="questionPosition")
-    entry_point: Optional[str] = Field(
-        None, alias="entryPoint",
-        description="Assessment Edit Opened — where the user entered the editor from.",
-    )
-    source: Optional[str] = Field(
-        None, description="Assessment Reopened — e.g. 'Past Assessment'."
-    )
-
-
-class TelemetryEventRequest(BaseModel):
-    request: Optional[TelemetryEventBody] = Field(
-        None, description="Sunbird request envelope."
-    )
-
-
-@api_v1_router.post(
-    "/telemetry/{job_id}",
-    summary="Report an editor lifecycle event (Assessment Edit Opened, Question Edit Started, Question Edit Cancelled, Assessment Reopened)",
-)
-async def report_telemetry_v1(
-    job_id: str,
-    payload: TelemetryEventRequest,
-    user_id: str = Depends(get_current_user),
-):
-    """
-    Report an event the backend cannot observe for itself.
-
-    Opening the editing workspace, opening a question for editing, cancelling an
-    edit and reopening a Past Assessment all happen entirely in the client — no
-    write reaches the server, so no endpoint sees them. Reporting them is
-    required, and metrics ("% Past Assessments reopened and edited", "average
-    time from generation to final save") are built on them, so the client reports
-    them here.
-
-    Only the four editor-lifecycle codes are accepted. Every event that describes
-    a write is emitted by the server itself and cannot be injected by a client.
-
-    Cancelling an edit needs no other call: discarding the client's local state
-    is what makes the change not persist, and this reports Question Edit Cancelled.
-    """
-    if payload.request is None:
-        return _missing_request_response()
-    body = payload.request
-
-    row = await get_assessment_status(job_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Assessment not found")
-    if not _owns(row, user_id):
-        raise HTTPException(
-            status_code=403, detail="Access denied: you do not own this assessment"
-        )
-
-    code = body.event_code.strip().upper()
-    event = telemetry.emit_ui_event(
-        code,
-        job_id=job_id,
-        editor_id=user_id,
-        assessment_version=int(row.get("version") or 1),
-        question_id=body.question_id,
-        question_type=body.question_type,
-        question_position=body.question_position,
-        entry_point=body.entry_point,
-        source=body.source,
-        assessment_type=((row.get("metadata") or {}).get("config") or {}).get(
-            "assessment_type"
-        ) if isinstance(row.get("metadata"), dict) else None,
-    )
-
-    if event is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"'{body.event_code}' is not a client-reportable event. "
-                   f"Accepted: {', '.join(sorted(telemetry.UI_REPORTED_EVENTS))}. "
-                   f"Events describing a write are emitted by the server.",
-        )
-
-    return {"recorded": True, "event_code": code,
-            "event_name": event["event_name"], "job_id": job_id}
 
 
 @api_v1_router.get(
@@ -1258,8 +1115,7 @@ async def update_assessment_v1(
     touched = {
         e["question_id"] for e in events
         if e.get("question_id")
-        and e["event_code"] in (telemetry.TEL_QUESTION_EDIT_SAVED,
-                                telemetry.TEL_QUESTION_ADDED)
+        and e["event_code"] in (AUDIT_QUESTION_EDIT_SAVED, AUDIT_QUESTION_ADDED)
     }
     # Which paths each question changed, so mapping vocabulary validation only
     # runs where the reviewer actually touched the mapping.
@@ -1273,7 +1129,7 @@ async def update_assessment_v1(
     # same way it does on `POST /questions/create` — and to them only.
     added = {
         e["question_id"] for e in events
-        if e.get("question_id") and e["event_code"] == telemetry.TEL_QUESTION_ADDED
+        if e.get("question_id") and e["event_code"] == AUDIT_QUESTION_ADDED
     }
     errors = validate_assessment(
         normalized, enable_blooms=_blooms_enabled(row), only_question_ids=touched,
@@ -1281,7 +1137,6 @@ async def update_assessment_v1(
         new_question_ids=added,
     )
     if errors:
-        _emit_validation_failure(job_id, user_id, row, "bulk_update", errors)
         logger.info(f"[{job_id}] Whole-blob update blocked by validation | "
                     f"errors={[e['code'] for e in errors][:10]}")
         return _validation_response(errors)
@@ -1355,12 +1210,6 @@ async def download_assessment_v1(
         f"[{job_id}] Generating {format} export | version={data.get('version')} | "
         f"questions={question_count(assessment_json)} | user={user_id}"
     )
-    telemetry.emit(telemetry.build_event(
-        telemetry.TEL_ASSESSMENT_DOWNLOADED,
-        job_id=job_id, editor_id=user_id,
-        assessment_version=int(data.get("version") or 1),
-        format=format, question_count=question_count(assessment_json),
-    ))
 
     if format == "csv":
         path = tmp_dir / f"{job_id}_assessment_v2.csv"

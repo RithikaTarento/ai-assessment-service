@@ -3,7 +3,7 @@
     "_postman_id": "e16ce47c-55ad-4bac-9455-820a6fcaaea1",
     "name": "iGOT AI Assessments",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
-    "description": "AI Assessment Generation Service\n\n**Environments:**\n- Local (direct):  set `base_url` = `http://localhost:8000/ai-assessments/v1`\n- UAT via Kong:    set `base_url` = `https://portal.uat.karmayogibharat.net/api/ai/assessments/v1`\n\n**Variables to set:**\n- `base_url`      \u2014 full base URL including version prefix (see above)\n- `auth_token`    \u2014 Keycloak JWT from iGot (x-authenticated-user-token)\n- `kong_api_key`  \u2014 Kong JWT credential (Authorization: bearer)\n- `job_id`        \u2014 paste Job ID returned from Generate to use in Status / Update / Download"
+    "description": "AI Assessment Generation Service\n\n**Environments:**\n- Local (direct):  set `base_url` = `http://localhost:8000/ai-assessments/v1`\n- UAT via Kong:    set `base_url` = `https://portal.uat.karmayogibharat.net/api/ai/assessments/v1`\n\n**Variables to set:**\n- `base_url`      — full base URL including version prefix (see above)\n- `auth_token`    — Keycloak JWT from iGot (x-authenticated-user-token)\n- `kong_api_key`  — Kong JWT credential (Authorization: bearer)\n- `job_id`        — paste Job ID returned from Generate to use in Status / Update / Download"
   },
   "variable": [
     {
@@ -19,12 +19,12 @@
     {
       "key": "kong_api_key",
       "value": "",
-      "description": "Kong JWT credential \u2014 goes in Authorization: bearer header"
+      "description": "Kong JWT credential — goes in Authorization: bearer header"
     },
     {
       "key": "job_id",
       "value": "",
-      "description": "Job ID returned from the Generate request \u2014 paste it here to use in Status / Update / Download"
+      "description": "Job ID returned from the Generate request — paste it here to use in Status / Update / Download"
     },
     {
       "key": "question_id",
@@ -102,7 +102,7 @@
               "type": "text",
               "key": "time_limit",
               "value": "0",
-              "description": "Minutes \u2014 0 means no limit"
+              "description": "Minutes — 0 means no limit"
             },
             {
               "type": "text",
@@ -114,13 +114,13 @@
               "type": "text",
               "key": "course_weightage",
               "value": "",
-              "description": "Comprehensive only \u2014 JSON e.g. {\"do_1\":60,\"do_2\":40}"
+              "description": "Comprehensive only — JSON e.g. {\"do_1\":60,\"do_2\":40}"
             },
             {
               "type": "text",
               "key": "course_names",
               "value": "",
-              "description": "Optional \u2014 comma-separated course names matching the order of course_ids e.g. \"Course A,Course B\""
+              "description": "Optional — comma-separated course names matching the order of course_ids e.g. \"Course A,Course B\""
             },
             {
               "type": "text",
@@ -545,46 +545,6 @@
               "key": "offset",
               "value": "0"
             }
-          ]
-        }
-      },
-      "response": []
-    },
-    {
-      "name": "Report Editor Lifecycle Event (Assessment Edit Opened / Question Edit Started / Question Edit Cancelled / Assessment Reopened)",
-      "request": {
-        "method": "POST",
-        "header": [
-          {
-            "key": "x-authenticated-user-token",
-            "value": "{{auth_token}}"
-          },
-          {
-            "key": "Authorization",
-            "value": "bearer {{kong_api_key}}"
-          },
-          {
-            "key": "Content-Type",
-            "value": "application/json"
-          }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"request\": {\n    \"eventCode\": \"TEL-02\",\n    \"questionId\": \"{{question_id}}\",\n    \"questionType\": \"mcq\",\n    \"questionPosition\": 1\n  }\n}",
-          "options": {
-            "raw": {
-              "language": "json"
-            }
-          }
-        },
-        "url": {
-          "raw": "{{base_url}}/telemetry/{{job_id}}",
-          "host": [
-            "{{base_url}}"
-          ],
-          "path": [
-            "telemetry",
-            "{{job_id}}"
           ]
         }
       },

@@ -184,16 +184,15 @@ When the requested per-type question counts sum to more than `QUESTION_BATCH_SIZ
 
 The `blueprint` is authored by the **last** batch, which is the only call that has seen the whole assessment. That batch's prompt and response schema are identical to a single call's; the earlier batches have the blueprint section blanked and the key dropped from their schema. Afterwards `generator._recount_generated_fields` overwrites the three blueprint fields that can only be known by reading every generated question — `blooms_taxonomy_mapping`, `difficulty_distribution` and `unified_competency_map` — because those are tallies, and a model asked to count two hundred questions will not get them right.
 
-### 4.8 Editing, Validation & Telemetry Modules
+### 4.8 Editing & Validation Modules
 
 Beyond `generator.py`, the question-editing workspace is implemented across several modules:
 
 | Module | Responsibility |
 |---|---|
 | `questions.py` | Question-level model helpers — the five canonical question-type buckets, the `question_order` sequence, and `normalize_assessment()`, which backfills `question_id`, `provenance` and option indexes on every read and write. |
-| `editing.py` | The editing operations (`apply_question_edit`, `apply_question_add`, `apply_question_delete`, `apply_question_reorder`, `diff_assessments`) as pure functions that return an updated assessment plus the audit/telemetry events the change produced. |
+| `editing.py` | The editing operations (`apply_question_edit`, `apply_question_add`, `apply_question_delete`, `apply_question_reorder`, `diff_assessments`) as pure functions that return an updated assessment plus the audit events the change produced. `AUDIT_EVENT_NAMES` declares the six kinds of change the audit trail records. |
 | `validation.py` | The validation gate and pre-update alerts — `validate_question`/`validate_assessment` block saving an invalid question, and `build_change_alerts`/`build_delete_alerts` describe the impact of a pending edit or deletion. |
-| `telemetry.py` | The telemetry event registry — declares the full set of event codes, builds and emits events to the audit table and any registered sink, and distinguishes the audited events from the UI-reported and observability-only ones. |
 | `batching.py` | Sequential batch planning and merging for large assessments — `plan_batches` splits a request exceeding `QUESTION_BATCH_SIZE` into per-question-type batches (dividing Bloom's levels and course counts so the parts sum to the whole), `summarize_for_dedup` builds the already-generated list each later batch is shown, and `merge_batches` recombines the results into one payload. |
 
 ---
@@ -334,15 +333,8 @@ assessment update. An audit row therefore exists if and only if the change was p
 A single save can produce several rows sharing one `assessment_version`: an answer-key
 change writes Question Edit Saved and Correct Answer Changed, a mapping change writes
 Question Edit Saved and Mapping Updated, and a reorder writes one Question Reordered event
-per question that moved. Option Added/Option Deleted and Validation Failed events are
-emitted as telemetry but are not audit feeds — nor are the following, which round out
-the telemetry event set with live call sites outside the audit trail:
-
-| Event | Fires when |
-|---|---|
-| Save Failed | Any editing save that did not persist — a version conflict (`409`) or a blocked validation (`400`) — emitted from `_commit`/`_emit_validation_failure` in `api.py`. |
-| Save Successful | An editing save commits, emitted from `_commit` in `api.py` right after the DB write is confirmed. |
-| Assessment Downloaded | A client calls `GET /download/{job_id}`, emitted once per export regardless of format. |
+per question that moved. The audit trail is the only place a user's changes are recorded;
+nothing else about their activity is tracked.
 
 | Column | Type | Description |
 |---|---|---|
@@ -539,7 +531,6 @@ Note that `docker-compose.yml` builds **both** the `api` and `worker` services f
 | `POST` | `/questions/delete/{job_id}` | Delete a question — `questionId` + `confirm: true` in body |
 | `POST` | `/questions/order/{job_id}` | Reorder questions — `questionOrder` array in body |
 | `GET` | `/audit/{job_id}` | Audit trail of all human changes |
-| `POST` | `/telemetry/{job_id}` | Client reports an editor lifecycle event (Assessment Edit Opened, Question Edit Started, Question Edit Cancelled, or Assessment Reopened) |
 | `PUT` | `/update/{job_id}` | Owner-only whole-blob edit of assessment_data (legacy) |
 | `GET` | `/history` | All jobs by the authenticated user |
 | `GET` | `/download/{job_id}?format=` | `csv` / `csv_basic` / `json` / `pdf` / `docx` — all built from the persisted final assessment |

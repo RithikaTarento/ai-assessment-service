@@ -546,46 +546,6 @@
       "response": []
     },
     {
-      "name": "Report Editor Lifecycle Event (Assessment Edit Opened / Question Edit Started / Question Edit Cancelled / Assessment Reopened)",
-      "request": {
-        "method": "POST",
-        "header": [
-          {
-            "key": "accept",
-            "value": "application/json"
-          },
-          {
-            "key": "cookie",
-            "value": "{{cookie}}"
-          },
-          {
-            "key": "Content-Type",
-            "value": "application/json"
-          }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"request\": {\n    \"eventCode\": \"TEL-02\",\n    \"questionId\": \"{{question_id}}\",\n    \"questionType\": \"mcq\",\n    \"questionPosition\": 1\n  }\n}",
-          "options": {
-            "raw": {
-              "language": "json"
-            }
-          }
-        },
-        "url": {
-          "raw": "{{base_url}}/telemetry/{{job_id}}",
-          "host": [
-            "{{base_url}}"
-          ],
-          "path": [
-            "telemetry",
-            "{{job_id}}"
-          ]
-        }
-      },
-      "response": []
-    },
-    {
       "name": "Update Whole Assessment (legacy)",
       "request": {
         "method": "PUT",

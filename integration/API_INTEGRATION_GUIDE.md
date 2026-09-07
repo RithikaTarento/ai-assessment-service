@@ -357,7 +357,6 @@ followed by `job_id` as the single trailing segment**:
 | `POST` | `/questions/delete/{job_id}` | `DELETE /assessments/{job_id}/questions/{question_id}` |
 | `POST` | `/questions/order/{job_id}` | `PUT /assessments/{job_id}/questions/order` |
 | `GET` | `/audit/{job_id}` | `GET /assessments/{job_id}/audit` |
-| `POST` | `/telemetry/{job_id}` | `POST /assessments/{job_id}/telemetry` |
 
 Three things follow, and they matter for anyone writing a client:
 
@@ -796,44 +795,11 @@ A reorder that shifts several questions produces one row per question whose posi
 
 A single edit can produce several rows. Changing an answer key writes Question Edit Saved **and** Correct Answer Changed; changing a mapping writes Question Edit Saved **and** Mapping Updated. All rows from one save share an `assessment_version`, so they can be grouped back into a single reviewer action.
 
-These are the six audit feeds the specification names. Option add/remove (Option Added / Option Deleted) and validation failures (Validation Failed) are emitted as telemetry but are not part of the audit record.
+These six audit feeds are the only record kept of a reviewer's activity. Nothing else about what a user does in the editor is tracked.
 
 ---
 
-### 9. Report an Editor Lifecycle Event
-
-**`POST /telemetry/{job_id}`**
-
-Reports an event the backend cannot observe for itself. Opening the editor, opening a question, cancelling an edit and reopening a Past Assessment all happen entirely in the client — no write reaches the server, so no endpoint sees them.
-
-```bash
-curl --location '.../telemetry/<job_id>' \
-  --header 'x-authenticated-user-token: <keycloak_jwt>' \
-  --header 'Content-Type: application/json' \
-  --data '{ "request": { "eventCode": "TEL-02", "questionId": "mcq_001",
-            "questionType": "mcq", "questionPosition": 1 } }'
-```
-
-| Event | Send with |
-|---|---|
-| Assessment Edit Opened | `entryPoint` |
-| Question Edit Started | `questionId`, `questionType`, `questionPosition` |
-| Question Edit Cancelled | `questionId` |
-| Assessment Reopened | `source` (e.g. `"Past Assessment"`) |
-
-Only these four events are accepted. Every event that describes a write — Question Edit Saved, Question Added, Question Deleted, Question Reordered, Correct Answer Changed, Mapping Updated, Save Failed, Save Successful — is emitted by the server itself and cannot be injected by a client; sending one returns 400.
-
-**Cancel needs no other call.** Discarding the client's local state is what makes a cancelled change not persist; this endpoint records that it happened.
-
-#### Response
-
-```json
-{ "recorded": true, "event_code": "TEL-02", "event_name": "Question Edit Started", "job_id": "..." }
-```
-
----
-
-### 10. Update Whole Assessment (legacy)
+### 9. Update Whole Assessment (legacy)
 
 **`PUT /update/{job_id}`**
 
@@ -863,7 +829,7 @@ curl --location --request PUT '.../update/<job_id>' \
 
 ---
 
-### 11. Get History
+### 10. Get History
 
 **`GET /history`**
 
@@ -940,7 +906,7 @@ curl --location 'https://portal.uat.karmayogibharat.net/apis/proxies/v8/ai/asses
 
 ---
 
-### 12. Download Assessment
+### 11. Download Assessment
 
 **`GET /download/{job_id}?format={format}`**
 
@@ -1134,16 +1100,7 @@ toast(res.message);                 // "Saved successfully" — the backend has 
 announce(res.announcement);         // ARIA live region, for reorder feedback
 ```
 
-Cancelling an edit needs no API call to undo anything — discard local state and re-read the question. Report it so the metrics see it:
-
-```js
-// entering the editor
-await POST(`/telemetry/${jobId}`, { request: { eventCode: 'TEL-01', entryPoint: 'generation_result' } });
-// opening one question
-await POST(`/telemetry/${jobId}`, { request: { eventCode: 'TEL-02', questionId: qid, questionPosition: pos } });
-// user pressed Cancel — nothing was written, just say so
-await POST(`/telemetry/${jobId}`, { request: { eventCode: 'TEL-04', questionId: qid } });
-```
+Cancelling an edit needs no API call to undo anything — discard local state and re-read the question. There is nothing to report: the editor makes no calls the user did not ask for.
 
 ---
 

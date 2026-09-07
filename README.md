@@ -215,7 +215,6 @@ ai-assessment-service/
 │       ├── questions.py             ← Editable question model: ids, ordering, provenance
 │       ├── validation.py            ← Validation gate + pre-update alerts
 │       ├── editing.py               ← Edit / add / delete / reorder operations + audit
-│       ├── telemetry.py             ← TEL-* event emission (pluggable sinks)
 │       ├── fetcher.py               ← Karmayogi Learning API client
 │       ├── db.py                    ← PostgreSQL async operations
 │       ├── auth.py                  ← JWT validation
@@ -314,31 +313,21 @@ HTTP concerns, so the rules are identical no matter which endpoint drove the cha
 - `diff_assessments()` — derives the same audit rows from a before/after comparison, backing the legacy whole-blob `PUT`
 - Enforces the provenance transitions: `ai_generated` → `ai_assisted` on first edit; manually added questions are `human_authored` and stay so however often they are edited
 
-#### `telemetry.py` — TEL-* events
-Declares the full telemetry event registry in one place; the events from Assessment Edit Opened through Assessment Reopened are emitted from the editing workspace. Groups D and E (Course Selected, Course Removed, Question Distribution Generated, Question Generation Requested, Generation Limit Validation, Configuration Mismatch) describe generation time and have no call sites yet.
+Audit events are declared in `AUDIT_EVENT_NAMES` — the six kinds of change the audit
+trail records:
 
-| Event |
+| Audit event |
 |---|
-| Assessment Edit Opened *(client-reported)* |
-| Question Edit Started *(client-reported)* |
 | Question Edit Saved |
-| Question Edit Cancelled *(client-reported)* |
 | Question Added |
 | Question Deleted |
 | Question Reordered |
-| Option Added / Option Deleted |
 | Correct Answer Changed |
 | Mapping Updated |
-| Validation Failed |
-| Save Failed / Save Successful |
-| Assessment Downloaded |
-| Assessment Reopened *(client-reported)* |
-| Question Distribution Generated *(generation-time)* |
-| Configuration Mismatch *(generation-time)* |
 
-- `AUDITED_EVENTS` — the six the specification names as audit feeds (Question Edit Saved, Question Added, Question Deleted, Question Reordered, Correct Answer Changed, Mapping Updated). Those are persisted to `interactive_assessment_audit` transactionally; the rest are logged only
-- `UI_REPORTED_EVENTS` — the four that happen entirely in the client and are reported through `POST /telemetry/{job_id}`. Any event describing a write is server-emitted and cannot be injected by a client
-- `register_sink()` is the extension point: a Kafka or analytics sink registers there and every existing call site starts feeding it with no further edits. The dashboard/reporting layer itself is not built
+Each one is persisted to `interactive_assessment_audit` in the same transaction as the
+assessment update, so an audit row exists if and only if the change was saved. Nothing
+about a user's activity is recorded anywhere else.
 
 #### `fetcher.py` — Course content retrieval
 Fetches all content for a given course from the Karmayogi platform.
@@ -550,7 +539,6 @@ uv run streamlit run ui/app.py
 | `POST` | `/questions/delete/{job_id}` | Delete a question — `questionId` + `confirm: true` in the body |
 | `POST` | `/questions/order/{job_id}` | Reorder questions — `questionOrder` array in the body |
 | `GET` | `/audit/{job_id}` | Audit trail of all human changes |
-| `POST` | `/telemetry/{job_id}` | Report an editor lifecycle event (Assessment Edit Opened, Question Edit Started, Question Edit Cancelled, or Assessment Reopened) |
 | `PUT` | `/update/{job_id}` | Replace the whole assessment (legacy; prefer the granular endpoints) |
 
 Every editing call is validated, versioned and audited. Send the assessment's `version`
@@ -793,7 +781,7 @@ WHERE status = 'COMPLETED';
 SELECT c->>'field' AS field, count(*) AS edits
 FROM interactive_assessment_audit,
      jsonb_array_elements(changed_fields) AS c
-WHERE event_code = 'TEL-03'
+WHERE event_code = 'TEL-03'   -- Question Edit Saved
 GROUP BY 1 ORDER BY edits DESC;
 
 -- Change history for one assessment
@@ -874,9 +862,6 @@ An answer-key change writes Question Edit Saved **and** Correct Answer Changed; 
 
 ### The competency triple must be edited together
 Changing only `competency_theme` leaves the stored sub-theme belonging to the old theme, and validation rejects it. Clients must send area, theme and sub-theme in the same request. `resources/competencies.json` is the vocabulary — note that it has exactly two areas (Behavioural, Functional) and that plausible-sounding themes like "Integrity" are not in it.
-
-### Adding a telemetry destination
-`telemetry.register_sink(fn)` at startup and every existing emission point feeds it — no call-site changes. Sinks must not raise (exceptions are caught and logged) and must not block, since they run on the request path. This is the intended seam for the reporting layer.
 
 ### Option `index` is the answer key, not array position
 `correct_option_index` is matched against each option's own `index` field. `normalize_assessment()` guarantees that field exists, filling it zero-based. Before that, the exporters disagreed on the fallback when `index` was absent — PDF/DOCX assumed zero-based, CSV assumed one-based — which could mark different options correct in different download formats for the same question.

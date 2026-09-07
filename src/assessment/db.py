@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS interactive_assessments (
 );
 """
 
-# Audit trail for every human change. One row per telemetry event
+# Audit trail for every human change. One row per recorded change
 # (Question Edit Saved / Question Added / Question Deleted / Question Reordered),
 # written in the same transaction as the assessment update so an audit row
 # exists if and only if the change persisted.

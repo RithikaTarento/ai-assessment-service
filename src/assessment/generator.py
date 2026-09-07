@@ -22,7 +22,6 @@ from .config import (
     GOOGLE_APPLICATION_CREDENTIALS, PROMPT_VERSION, INTERACTIVE_COURSES_PATH,
     QUESTION_BATCH_SIZE, BATCH_MAX_ATTEMPTS, ENABLE_QUESTION_BATCHING,
 )
-from . import telemetry
 from .batching import Batch, apportion, merge_batches, plan_batches, summarize_for_dedup
 from .questions import BUCKET_BY_TYPE_KEY
 

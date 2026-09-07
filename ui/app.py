@@ -505,27 +505,6 @@ with tab_view:
                 for err in body.get("errors", []):
                     st.warning(f"• `{err.get('field')}` — {err.get('message')}")
 
-            def report_event(code, **fields):
-                """
-                Report an editor lifecycle event (Assessment Edit Opened,
-                Question Edit Started, Question Edit Cancelled, Assessment
-                Reopened). These happen entirely in the client, so the backend
-                cannot see them.
-                """
-                # Callers pass snake_case kwargs; the envelope is camelCase.
-                camel = {"question_id": "questionId", "question_type": "questionType",
-                         "question_position": "questionPosition",
-                         "entry_point": "entryPoint", "source": "source"}
-                try:
-                    requests.post(
-                        f"{API_V1}/telemetry/{job_id}", headers=get_headers(),
-                        json={"request": {
-                            "eventCode": code,
-                            **{camel.get(k, k): v for k, v in fields.items()
-                               if v is not None}}})
-                except Exception:
-                    pass  # telemetry must never break the editor
-
             def show_alerts(alerts):
                 """Render the pre-update / post-save alerts."""
                 icons = {"high": "🔴", "medium": "🟠", "low": "🟡", "info": "ℹ️"}
@@ -582,15 +561,6 @@ with tab_view:
                 version = q_data["version"]
                 q_list = q_data["questions"]
                 q_order = q_data["question_order"]
-
-                # Reports Assessment Edit Opened, and Assessment Reopened when this
-                # assessment has been saved before (i.e. reopened rather than freshly
-                # generated).
-                if st.session_state.get("editor_opened_for") != job_id:
-                    st.session_state["editor_opened_for"] = job_id
-                    report_event("TEL-01", entry_point="streamlit_test_ui")
-                    if version > 1:
-                        report_event("TEL-16", source="Past Assessment")
 
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Questions", q_data["total_questions"])
@@ -781,14 +751,6 @@ with tab_view:
                               f"{label[:60]}")
 
                     with st.expander(header):
-                        # Question Edit Started — reported once per question
-                        # per session, when its editor is first rendered.
-                        started_key = f"edit_started_{job_id}_{qid}"
-                        if not st.session_state.get(started_key):
-                            st.session_state[started_key] = True
-                            report_event("TEL-02", question_id=qid, question_type=tkey,
-                                         question_position=pos)
-
                         # ---------- reorder ----------
                         rc1, rc2, rc3, rc4 = st.columns([1, 1, 2, 3])
                         def move_to(target):
@@ -1132,7 +1094,6 @@ with tab_view:
                                 # unmodified server data) instead of trying to
                                 # redisplay the ones that just held the edit.
                                 st.session_state[f"edit_gen_{job_id}_{qid}"] = edit_gen + 1
-                                report_event("TEL-04", question_id=qid)
                                 st.info("Changes discarded. Nothing was saved.")
                                 st.rerun()
 
