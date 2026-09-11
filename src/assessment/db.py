@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS interactive_assessment_audit (
     id BIGSERIAL PRIMARY KEY,
     job_id TEXT NOT NULL,
     assessment_version INTEGER NOT NULL,
-    event_code TEXT NOT NULL,          -- TEL-03 / TEL-05 / TEL-06 / TEL-07 / TEL-10 / TEL-11
+    event_code TEXT NOT NULL,          -- question_edit / question_delete
     editor_id TEXT NOT NULL,           -- who made the change (attributability)
     question_id TEXT,
     question_type TEXT,

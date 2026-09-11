@@ -797,7 +797,7 @@ curl --location '.../audit/<job_id>?limit=200&offset=0' \
     {
       "id": 41,
       "assessment_version": 5,
-      "event_code": "TEL-03",
+      "event_code": "question_edit",
       "editor_id": "1e8b6826-3326-4175-b202-f5f5971f457a",
       "question_id": "mcq_001",
       "question_type": "mcq",
@@ -819,18 +819,25 @@ curl --location '.../audit/<job_id>?limit=200&offset=0' \
 
 | Field | Description |
 |---|---|
-| `event_code` | `TEL-03` Question Edit Saved · `TEL-05` Question Added · `TEL-06` Question Deleted · `TEL-07` Question Reordered · `TEL-10` Correct Answer Changed · `TEL-11` Mapping Updated. The code is the whole fact — there is no display-name field, because the wording is [yours](#what-the-client-owns). |
+| `event_code` | `question_edit` Question Edit Saved · `question_delete` Question Deleted. The code is the whole fact — there is no display-name field, because the wording is [yours](#what-the-client-owns). (`question_add` and `question_reorder` are no longer recorded — keep handling them if you display history written before that change.) |
 | `editor_id` | The user who made the change |
 | `changed_fields` | Each changed field with its previous and new value |
 | `original_question` | The AI-generated question, captured on the first human edit. `null` for human-authored questions. |
 | `assessment_version` | The version this change produced |
 | `ai_original` | The complete pristine AI-generated assessment, retained regardless of later edits |
 
-A reorder that shifts several questions produces one row per question whose position changed, all sharing the same `assessment_version`.
+Only edits and deletions are recorded. Adding a question and reordering questions both
+take effect normally and are returned by `GET /status` as usual — they simply produce no
+audit row. So a save can return **zero** entries while still advancing the version, and
+the trail will contain version gaps: seeing v5 followed by v8 does not mean entries are
+missing.
 
-A single edit can produce several rows. Changing an answer key writes Question Edit Saved **and** Correct Answer Changed; changing a mapping writes Question Edit Saved **and** Mapping Updated. All rows from one save share an `assessment_version`, so they can be grouped back into a single reviewer action.
+Whether a save changed the answer key or a mapping field is on the Question Edit Saved
+row itself, in `details.answer_key_changed` / `details.mapping_fields_changed` — as in
+the sample above. All rows from one save share an `assessment_version`, so they can be
+grouped back into a single reviewer action.
 
-These six audit feeds are the only record kept of a reviewer's activity. Nothing else about what a user does in the editor is tracked.
+These audit feeds are the only record kept of a reviewer's activity. Nothing else about what a user does in the editor is tracked.
 
 ---
 

@@ -1180,10 +1180,10 @@ with tab_view:
                                        f"{audit['count']} recorded change(s) · "
                                        f"first edited: {audit.get('edited_at') or 'never'}")
                             EVENT_LABELS = {
-                                "TEL-03": "Edit saved", "TEL-05": "Added",
-                                "TEL-06": "Deleted", "TEL-07": "Reordered",
-                                "TEL-10": "Answer key changed",
-                                "TEL-11": "Mapping updated",
+                                "question_edit": "Edit saved",
+                                # "question_add": "Added",
+                                "question_delete": "Deleted",
+                                # "question_reorder": "Reordered",
                             }
                             for entry in audit["audit_trail"]:
                                 bits = [
@@ -1199,10 +1199,18 @@ with tab_view:
                                     st.caption(f"    position "
                                                f"{entry.get('previous_position')} → "
                                                f"{entry.get('new_position')}")
-                                if entry["event_code"] == "TEL-10":
-                                    d = entry.get("details") or {}
-                                    st.caption(f"    answer {d.get('previous_answer')!r} → "
-                                               f"{d.get('updated_answer')!r}")
+                                if entry["event_code"] == "question_edit" and \
+                                        (entry.get("details") or {}).get("answer_key_changed"):
+                                    answer_change = next(
+                                        (c for c in entry.get("changed_fields") or []
+                                         if c["field"] in ("correct_option_index",
+                                                            "correct_answer", "pairs")),
+                                        None,
+                                    )
+                                    if answer_change:
+                                        st.caption(f"    answer "
+                                                   f"{answer_change['previous_value']!r} → "
+                                                   f"{answer_change['new_value']!r}")
                                 for c in entry.get("changed_fields") or []:
                                     st.caption(f"    `{c['field']}`: "
                                                f"{str(c['previous_value'])[:80]!r} → "

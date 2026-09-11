@@ -191,7 +191,7 @@ Beyond `generator.py`, the question-editing workspace is implemented across seve
 | Module | Responsibility |
 |---|---|
 | `questions.py` | Question-level model helpers — the five canonical question-type buckets, the `question_order` sequence, and `normalize_assessment()`, which backfills `question_id`, `provenance` and option indexes on every read and write. |
-| `editing.py` | The editing operations (`apply_question_edit`, `apply_question_add`, `apply_question_delete`, `apply_question_reorder`, `diff_assessments`) as pure functions that return an updated assessment plus the audit events the change produced. `AUDIT_EVENT_CODES` declares the six kinds of change the audit trail records. |
+| `editing.py` | The editing operations (`apply_question_edit`, `apply_question_add`, `apply_question_delete`, `apply_question_reorder`, `diff_assessments`) as pure functions that return an updated assessment plus the audit events the change produced. `AUDIT_EVENT_CODES` declares which of those events the audit trail actually records — edits and deletions; additions and reorders are produced but not stored. |
 | `validation.py` | The validation gate — `validate_question`/`validate_assessment` block saving an invalid question. Errors are `code` + `field` + `question_id` + `params`, with no message string: the client owns the copy because it owns the user's language. `classify_option_change` tells an option re-sequencing from a real answer-key edit, and is here because the **audit trail** records that distinction. |
 | `batching.py` | Sequential batch planning and merging for large assessments — `plan_batches` splits a request exceeding `QUESTION_BATCH_SIZE` into per-question-type batches (dividing Bloom's levels and course counts so the parts sum to the whole), `summarize_for_dedup` builds the already-generated list each later batch is shown, and `merge_batches` recombines the results into one payload. |
 
@@ -330,18 +330,25 @@ Two tables, both created by `db.py` at startup, with additive `ADD COLUMN IF NOT
 One row per human change to an assessment, written inside the same transaction as the
 assessment update. An audit row therefore exists if and only if the change was persisted.
 
-A single save can produce several rows sharing one `assessment_version`: an answer-key
-change writes Question Edit Saved and Correct Answer Changed, a mapping change writes
-Question Edit Saved and Mapping Updated, and a reorder writes one Question Reordered event
-per question that moved. The audit trail is the only place a user's changes are recorded;
-nothing else about their activity is tracked.
+Only edits and deletions are recorded. Additions and reorders are still produced as
+events — `EditResult.changed` and the whole-blob `PUT`'s validation set both depend on
+them — but are commented out of `AUDIT_EVENT_CODES`, which `EditResult.audit_rows` is the
+only consumer of, so they are never written as rows.
+
+A single save can therefore produce several rows sharing one `assessment_version` (a
+whole-blob `PUT` changing several questions), exactly one, or none at all — a save that
+only adds or reorders writes nothing while still advancing the version, so version gaps
+in the trail are expected. `question_edit`'s own `details` flags whether the save changed
+the answer key (`answer_key_changed`) or a mapping field (`mapping_fields_changed`); each
+of those used to get an extra row of its own, but that duplicated the same information,
+so they were retired. Nothing about a user's activity is tracked beyond this table.
 
 | Column | Type | Description |
 |---|---|---|
 | `id` | `BIGSERIAL` PRIMARY KEY | Insertion order, which is also the chronological order |
 | `job_id` | `TEXT` | The assessment this change belongs to |
 | `assessment_version` | `INTEGER` | The version this change produced |
-| `event_code` | `TEXT` | The six audit feeds: `TEL-03` Question Edit Saved · `TEL-05` Question Added · `TEL-06` Question Deleted · `TEL-07` Question Reordered · `TEL-10` Correct Answer Changed · `TEL-11` Mapping Updated. Stored as the code alone — the display name is the client's to supply. |
+| `event_code` | `TEXT` | The recorded feeds: `question_edit` · `question_delete`. Stored as the code alone — the display name is the client's to supply. (`question_add` and `question_reorder` are no longer written; rows predating that change still carry them.) |
 | `editor_id` | `TEXT` | The user who made the change |
 | `question_id` | `TEXT` | Affected question |
 | `question_type` | `TEXT` | `mcq` / `ftb` / `mtf` / `multichoice` / `truefalse` |

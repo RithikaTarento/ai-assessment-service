@@ -313,22 +313,33 @@ HTTP concerns, so the rules are identical no matter which endpoint drove the cha
 - `diff_assessments()` — derives the same audit rows from a before/after comparison, backing the legacy whole-blob `PUT`
 - Enforces the provenance transitions: `ai_generated` → `ai_assisted` on first edit; manually added questions are `human_authored` and stay so however often they are edited
 
-Audit events are declared in `AUDIT_EVENT_CODES` — the six kinds of change the audit
-trail records. Only the code is stored; the display name below is this document's
-wording, not a field, because the copy belongs to the client:
+`AUDIT_EVENT_CODES` declares the kinds of change the audit trail records. Only the code
+is stored; the display name below is this document's wording, not a field, because the
+copy belongs to the client:
 
-| Audit event |
-|---|
-| Question Edit Saved |
-| Question Added |
-| Question Deleted |
-| Question Reordered |
-| Correct Answer Changed |
-| Mapping Updated |
+| `event_code` | Audit event | Recorded |
+|---|---|---|
+| `question_edit` | Question Edit Saved | Yes |
+| `question_delete` | Question Deleted | Yes |
+| `question_add` | Question Added | No — see below |
+| `question_reorder` | Question Reordered | No — see below |
 
-Each one is persisted to `interactive_assessment_audit` in the same transaction as the
-assessment update, so an audit row exists if and only if the change was saved. Nothing
-about a user's activity is recorded anywhere else.
+An answer-key change or a mapping change doesn't get its own row — `question_edit`
+already carries that in `details.answer_key_changed` / `details.mapping_fields_changed`
+and in `changed_fields`.
+
+Additions and reorders are **still produced as events but no longer written as rows**:
+they are commented out of `AUDIT_EVENT_CODES`, which `EditResult.audit_rows` is the only
+consumer of. Their emission must stay — `EditResult.changed` is `bool(events)` and the
+reorder endpoint gates its commit on it, and the whole-blob `PUT` builds its validation
+set from the `question_add` events. Removing the emission would silently turn reorders
+into no-ops and let added questions bypass the validation gate. An added question is
+still identifiable after the fact by its `human_authored` provenance and its `q_`-prefixed
+id; what is no longer recorded is who added it and when.
+
+A recorded change is persisted to `interactive_assessment_audit` in the same transaction
+as the assessment update, so an audit row exists if and only if the change was saved.
+Nothing about a user's activity is recorded anywhere else.
 
 #### `fetcher.py` — Course content retrieval
 Fetches all content for a given course from the Karmayogi platform.
@@ -732,7 +743,7 @@ row exists if and only if the change was actually persisted.
 | `id` | BIGSERIAL PRIMARY KEY | Insertion order — also the chronological order |
 | `job_id` | TEXT | The assessment this change belongs to |
 | `assessment_version` | INTEGER | The version this change produced |
-| `event_code` | TEXT | `TEL-03` Question Edit Saved · `TEL-05` Question Added · `TEL-06` Question Deleted · `TEL-07` Question Reordered · `TEL-10` Correct Answer Changed · `TEL-11` Mapping Updated |
+| `event_code` | TEXT | `question_edit` · `question_delete`. (`question_add` and `question_reorder` are no longer written; rows from before that change still carry them.) |
 | `editor_id` | TEXT | The user who made the change |
 | `question_id` | TEXT | Affected question |
 | `question_type` | TEXT | `mcq` / `ftb` / `mtf` / `multichoice` / `truefalse` |
@@ -785,7 +796,7 @@ WHERE status = 'COMPLETED';
 SELECT c->>'field' AS field, count(*) AS edits
 FROM interactive_assessment_audit,
      jsonb_array_elements(changed_fields) AS c
-WHERE event_code = 'TEL-03'   -- Question Edit Saved
+WHERE event_code = 'question_edit'
 GROUP BY 1 ORDER BY edits DESC;
 
 -- Change history for one assessment
@@ -861,8 +872,8 @@ Every successful editing call returns the new `version`. A client that does not 
 
 This is also what satisfies "duplicate save requests must be prevented": two requests carrying the same version cannot both apply, and a versionless repeat diffs to nothing. There is no separate idempotency key.
 
-### One save can write several audit rows
-An answer-key change writes Question Edit Saved **and** Correct Answer Changed; a mapping change writes Question Edit Saved **and** Mapping Updated; a reorder writes one Question Reordered per question that moved. Rows from one save share an `assessment_version`, which is how they group back into a single reviewer action. Do not assume one row per save.
+### One save can write several audit rows — or none
+A whole-blob `PUT` that changes several questions writes one `question_edit` row per changed question, and rows from one save share an `assessment_version`, which is how they group back into a single reviewer action. Do not assume one row per save. Nor assume at least one: since additions and reorders are no longer recorded, a save consisting only of those writes **zero** rows while still advancing the version — so the trail legitimately contains version gaps. (An answer-key or mapping change likewise writes no row of its own; the flags for it live on `question_edit`.)
 
 ### The competency triple must be edited together
 Changing only `competency_theme` leaves the stored sub-theme belonging to the old theme, and validation rejects it. Clients must send area, theme and sub-theme in the same request. `resources/competencies.json` is the vocabulary — note that it has exactly two areas (Behavioural, Functional) and that plausible-sounding themes like "Integrity" are not in it.
@@ -892,6 +903,6 @@ Options are re-sequenced within a question through the ordinary `POST /questions
 
 A client's answer-key control must select an **option**, not an index. Offer bare index numbers next to a reorder control and the two readings of "3" — *the option currently at index 3* versus *the index the correct option should end up at* — pick different options, and the reviewer has no way to tell which one they got. The Streamlit editor labels every entry with the option's own text for exactly this reason.
 
-`classify_option_change()` tells a pure re-sequencing (same option texts, new order) apart from a genuine content edit, and the **audit row** records the distinction — `options_reordered` on Question Edit Saved, `reindexed_only` on Correct Answer Changed. Without it the trail would read as a reviewer changing the answer key, which is the one thing an audit of an assessment must not get wrong.
+`classify_option_change()` tells a pure re-sequencing (same option texts, new order) apart from a genuine content edit, and the **audit row** records the distinction — `options_reordered` and `reindexed_only`, both in `details` on Question Edit Saved. Without it the trail would read as a reviewer changing the answer key, which is the one thing an audit of an assessment must not get wrong.
 
 A client showing a pre-save warning needs the same comparison, and must make it locally: same option texts in a new order means "options reordered", not "the correct answer will change".

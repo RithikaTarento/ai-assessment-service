@@ -1110,7 +1110,11 @@ async def update_assessment_v1(
         "version": version,
         "question_order": normalized.get("question_order", []),
         "total_questions": question_count(normalized),
-        "changes_recorded": len(result.audit_rows),
+        # Counts every change this save made, not just the ones the audit trail
+        # stores — additions and reorders are no longer written as rows, and a
+        # save consisting only of those would otherwise report zero.
+        # "changes_recorded": len(result.audit_rows),
+        "changes_recorded": len(result.events),
     }
 
 SUPPORTED_FORMATS = {"csv", "csv_basic", "json", "pdf", "docx"}

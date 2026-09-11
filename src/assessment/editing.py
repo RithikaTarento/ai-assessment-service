@@ -58,17 +58,35 @@ from .validation import (
 # --------------------------------------------------------------------------
 # Every change an editing operation makes is recorded as one audit row, and the
 # code below says which kind of change it was. The code strings are stored
-# verbatim in `interactive_assessment_audit.event_code`, so they stay as they
-# are for the sake of rows that have already been written.
+# verbatim in `interactive_assessment_audit.event_code`, so renaming one means
+# migrating every row that already carries the old spelling — see
+# `migrations/004_rename_audit_event_codes.sql`.
 
-AUDIT_QUESTION_EDIT_SAVED = "TEL-03"
-AUDIT_QUESTION_ADDED = "TEL-05"
-AUDIT_QUESTION_DELETED = "TEL-06"
-AUDIT_QUESTION_REORDERED = "TEL-07"
-AUDIT_CORRECT_ANSWER_CHANGED = "TEL-10"
-AUDIT_MAPPING_UPDATED = "TEL-11"
+AUDIT_QUESTION_EDIT_SAVED = "question_edit"
+AUDIT_QUESTION_ADDED = "question_add"
+AUDIT_QUESTION_DELETED = "question_delete"
+AUDIT_QUESTION_REORDERED = "question_reorder"
 
-# The codes that are persisted to the audit trail — exactly six feeds.
+# An answer-key change and a mapping change each used to get an extra row of
+# their own alongside the `question_edit` row for the same save. Neither
+# carried anything `question_edit` did not already hold
+# (`details.answer_key_changed` / `details.mapping_fields_changed`, plus the
+# field itself in `changed_fields`), so they were retired rather than renamed.
+
+# The codes that are persisted to the audit trail — edits and deletions.
+#
+# `question_add` and `question_reorder` are commented out below: they are still
+# produced as events, and must stay that way — do not "simplify" this by
+# removing their emission in `apply_question_add`, `apply_question_reorder` or
+# `diff_assessments`, because the events carry load beyond the audit trail:
+#   * `EditResult.changed` is `bool(self.events)`, and the reorder endpoint
+#     gates its commit on it — a reorder producing no events would silently
+#     save nothing and report `order_unchanged`;
+#   * the whole-assessment `PUT` builds its validation set from the
+#     `question_add` events, so without them an added question would never
+#     reach the validation gate or the new-question option ceiling.
+# This set is consulted only by `audit_rows`, which is what makes "compute the
+# event, don't store the row" expressible here rather than at the emission site.
 #
 # There is deliberately no display name alongside them. A label like "Question
 # Edit Saved" is English copy, and the copy belongs to the client because the
@@ -77,11 +95,9 @@ AUDIT_MAPPING_UPDATED = "TEL-11"
 # `validation._err`). A client renders these codes through its own string table.
 AUDIT_EVENT_CODES: frozenset = frozenset({
     AUDIT_QUESTION_EDIT_SAVED,
-    AUDIT_QUESTION_ADDED,
+    # AUDIT_QUESTION_ADDED,          # no longer written to the audit table
     AUDIT_QUESTION_DELETED,
-    AUDIT_QUESTION_REORDERED,
-    AUDIT_CORRECT_ANSWER_CHANGED,
-    AUDIT_MAPPING_UPDATED,
+    # AUDIT_QUESTION_REORDERED,      # no longer written to the audit table
 })
 
 
@@ -97,9 +113,11 @@ class EditResult:
     @property
     def audit_rows(self) -> List[Dict[str, Any]]:
         """
-        The events that are persisted to the audit trail — exactly six feeds:
-        Question Edit Saved, Question Added, Question Deleted, Question
-        Reordered, Correct Answer Changed and Mapping Updated.
+        The events that are persisted to the audit trail: Question Edit Saved
+        and Question Deleted.
+
+        Additions and reorders are still returned by `events` — they are just
+        not stored. See `AUDIT_EVENT_CODES`.
         """
         return [e for e in self.events if e["event_code"] in AUDIT_EVENT_CODES]
 
@@ -268,42 +286,9 @@ def apply_question_edit(
             "answer_key_changed": answer_key_changed,
             "mapping_fields_changed": mapping_changed,
             "options_reordered": options_reordered,
+            "reindexed_only": answer_reindexed,
         },
     )]
-
-    # Correct Answer Changed — carries the previous and updated
-    # answer, and feeds the audit trail in its own right.
-    if answer_key_changed:
-        answer_change = next(c for c in changed_fields if c["field"] in ANSWER_KEY_FIELDS)
-        events.append(_event(
-            AUDIT_CORRECT_ANSWER_CHANGED,
-            editor_id=editor_id,
-            question_id=question_id,
-            question_type=q_type_key,
-            previous_position=position,
-            new_position=position,
-            changed_fields=[answer_change],
-            question_snapshot=snapshot,
-            details={"field": answer_change["field"],
-                     "previous_answer": answer_change["previous_value"],
-                     "updated_answer": answer_change["new_value"],
-                     "reindexed_only": answer_reindexed},
-        ))
-
-    # Mapping Updated — which mapping field changed. Also an
-    # audit feed in its own right.
-    if mapping_changed:
-        events.append(_event(
-            AUDIT_MAPPING_UPDATED,
-            editor_id=editor_id,
-            question_id=question_id,
-            question_type=q_type_key,
-            previous_position=position,
-            new_position=position,
-            changed_fields=[c for c in changed_fields if c["field"] in MAPPING_FIELDS],
-            question_snapshot=snapshot,
-            details={"mapping_fields_changed": mapping_changed},
-        ))
 
     return EditResult(
         assessment_data=data,
@@ -655,44 +640,9 @@ def diff_assessments(
                 "answer_key_changed": answer_key_changed,
                 "mapping_fields_changed": mapping_changed,
                 "options_reordered": options_reordered,
+                "reindexed_only": answer_reindexed,
             },
         ))
-
-        # Correct Answer Changed — an audit feed in its own right.
-        if answer_key_changed:
-            answer_change = next(
-                c for c in changed_fields if c["field"] in ANSWER_KEY_FIELDS)
-            events.append(_event(
-                AUDIT_CORRECT_ANSWER_CHANGED,
-                editor_id=editor_id,
-                question_id=qid,
-                question_type=TYPE_KEY_BY_BUCKET.get(bucket, bucket),
-                previous_position=old_order.index(qid) + 1,
-                new_position=new_order.index(qid) + 1,
-                changed_fields=[answer_change],
-                question_snapshot=copy.deepcopy(new_question),
-                details={"source": "bulk_update",
-                         "field": answer_change["field"],
-                         "previous_answer": answer_change["previous_value"],
-                         "updated_answer": answer_change["new_value"],
-                         "reindexed_only": answer_reindexed},
-            ))
-
-        # Mapping Updated — an audit feed in its own right.
-        if mapping_changed:
-            events.append(_event(
-                AUDIT_MAPPING_UPDATED,
-                editor_id=editor_id,
-                question_id=qid,
-                question_type=TYPE_KEY_BY_BUCKET.get(bucket, bucket),
-                previous_position=old_order.index(qid) + 1,
-                new_position=new_order.index(qid) + 1,
-                changed_fields=[c for c in changed_fields
-                                if c["field"] in MAPPING_FIELDS],
-                question_snapshot=copy.deepcopy(new_question),
-                details={"source": "bulk_update",
-                         "mapping_fields_changed": mapping_changed},
-            ))
 
     # Reordered -----------------------------------------------------------
     # An absolute position changes whenever a question earlier in the sequence
