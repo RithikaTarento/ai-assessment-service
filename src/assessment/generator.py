@@ -445,13 +445,10 @@ def case_study_levels(
     can look like 25% inside a small batch; deciding once, here, gives every
     batch and top-up call the same answer.
 
-    A level qualifies at CASE_STUDY_MIN_LEVEL_PCT or more of the total. Beginner
-    gets none: its difficulty rule limits any scenario to 2-3 sentences. This
+    A level qualifies at CASE_STUDY_MIN_LEVEL_PCT or more of the total. This
     only decides which levels MAY carry a case study — whether any question does
     is left to the model.
     """
-    if (difficulty_level or "").lower() == "beginner":
-        return []
     total = sum(level_weights.values())
     if total <= 0:
         return []
